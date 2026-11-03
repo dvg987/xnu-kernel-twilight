@@ -13,6 +13,7 @@
 #include <libkern/c++/OSData.h>
 
 extern "C" void HakiosBluetoothStart(const uint8_t * address);
+extern "C" void HakiosHIDResourceStart(void);    /* drivers/bluetooth/hakios.hidres.cpp */
 
 class HakiosBluetooth : public IOService
 {
@@ -61,5 +62,6 @@ HakiosBluetoothStart(const uint8_t * address)
 	}
 	bt->registerService();
 	IOLog("HakiosBluetooth: the controller's service is there\n");
+	HakiosHIDResourceStart();
 	bt->release();
 }

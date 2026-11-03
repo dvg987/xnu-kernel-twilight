@@ -249,6 +249,22 @@ event(uint8_t code, const uint8_t *p, unsigned n)
 	if (b.step == 3 && uart_connected && b.waiting_op == 0) {
 		uint8_t e[2] = { code, (uint8_t)n }, q[255];
 
+		/* what security and links do, for the log: the controller's side of a pairing */
+		if (code == EV_ENC_CHANGE && n >= 4) {
+			printf("w2bt: trace: encryption change, status %#x, handle %#x, on %u\n", p[0], le16(p + 1), p[3]);
+		} else if (code == 0x30 && n >= 3) {
+			printf("w2bt: trace: encryption key refresh complete, status %#x, handle %#x\n", p[0], le16(p + 1));
+		} else if (code == EV_DISCONNECT && n >= 4) {
+			printf("w2bt: trace: disconnected, status %#x, handle %#x, reason %#x\n", p[0], le16(p + 1), p[3]);
+		} else if (code == EV_CMD_STATUS && n >= 4 && p[0] != 0) {
+			printf("w2bt: trace: command %#x refused by the controller (status %#x)\n", le16(p + 2), p[0]);
+		} else if (code == EV_LE_META && n >= 1 && (p[0] == 0x05 || p[0] == 0x01 || p[0] == 0x0a)) {
+			printf("w2bt: trace: LE event %#x (%s)%s%#x\n", p[0], p[0] == 0x05 ? "the remote asks for the key" :
+			    "connection complete", p[0] == 0x05 ? "" : ", status ", p[0] == 0x05 ? 0 : p[1]);
+		} else if (code == EV_CMD_STATUS && n >= 4 && (le16(p + 2) == 0x2019 || le16(p + 2) == 0x201a)) {
+			printf("w2bt: trace: command %#x taken\n", le16(p + 2));
+		}
+
 		memcpy(q, p, n);
 		if (code == EV_CMD_COMPLETE && n >= 4 && q[3] != 0) {
 			static unsigned told;
@@ -630,6 +646,10 @@ from_darwin(const uint8_t *p, unsigned n)
 			}
 			bridge_to_darwin(0x04, e, 2, q, 4 + extra);
 			return;
+		}
+		if (op == 0x2019 || op == 0x201a || op == 0x201b || op == 0x0406) {
+			printf("w2bt: trace: Darwin sends %#x (%s)\n", op, op == 0x2019 ? "start encryption" : op == 0x201a ?
+			    "the key, asked for" : op == 0x201b ? "no key" : "disconnect");
 		}
 		raw_command(p + 1, n - 1);
 	} else if (p[0] == 0x02) {
