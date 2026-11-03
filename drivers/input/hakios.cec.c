@@ -8,8 +8,12 @@
  * Polled from a kernel thread, no interrupt. The programming model is Amlogic's Linux driver
  * (common_drivers/drivers/media/cec: hdmi_ao_cec.c, hdmi_aocec_api.c): the controller's own registers are
  * reached one byte at a time through AO_CECB_RW_REG. The 32.768 kHz clock and the GPIOH_3 pin are set here
- * as Linux's clock and pinctrl drivers would, in case the firmware left them otherwise. The physical address
- * is 1.0.0.0 (no EDID reader yet): the box on the TV's first HDMI input as far as the TV is told.
+ * as Linux's clock and pinctrl drivers would, in case the firmware left them otherwise.
+ *
+ * The physical address (which of the TV's inputs the box is on) comes from the TV's EDID; with no EDID reader
+ * yet it is boot-arg cec_pa (e.g. cec_pa=0x2000 for input 2), else the one Linux's driver last left in
+ * SYSCTRL_STATUS_REG1. Without one the box never claims to be the active source: the TV would switch to
+ * an input that is not the box's ("no signal").
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -63,7 +67,8 @@ extern void IODelay(unsigned int microseconds);
 #define I_RX_WAKEUP     (1u << 6)
 #define I_ALL           0x7fu
 
-#define PHYS_ADDR       0x1000
+#define SYSCTRL_STATUS_REG1     0xfe010284UL    /* [15:0]: the physical address Linux's driver saw last */
+#define PHYS_ADDR       c.pa
 #define BROADCAST       0xf
 #define OSD_NAME        "Apple TV"
 /* Apple's IEEE OUI, as an Apple TV reports it */
@@ -74,6 +79,7 @@ enum { TX_OK, TX_NACK, TX_FAIL };
 static struct {
 	vm_offset_t ao, clk, pad;
 	int la;                 /* our logical address, 15 = none */
+	uint32_t pa;            /* our physical address, 0xffff = not known */
 	uint32_t pending;       /* status bits seen while transmitting, for the receiver */
 	uint32_t held;          /* the key record of the button down now, 0 = none */
 	unsigned frames;
@@ -205,12 +211,15 @@ send(int to, const uint8_t *body, int n)
 static void
 announce(void)
 {
-	static const uint8_t report_pa[] = { 0x84, PHYS_ADDR >> 8, PHYS_ADDR & 0xff, 4 };
-	static const uint8_t vendor[] = { 0x87, VENDOR_ID >> 16, (VENDOR_ID >> 8) & 0xff, VENDOR_ID & 0xff };
-	static const uint8_t view_on[] = { 0x04 };
-	static const uint8_t active[] = { 0x82, PHYS_ADDR >> 8, PHYS_ADDR & 0xff };
-	static const uint8_t menu_on[] = { 0x8e, 0x00 };
+	const uint8_t report_pa[] = { 0x84, PHYS_ADDR >> 8, PHYS_ADDR & 0xff, 4 };
+	const uint8_t vendor[] = { 0x87, VENDOR_ID >> 16, (VENDOR_ID >> 8) & 0xff, VENDOR_ID & 0xff };
+	const uint8_t view_on[] = { 0x04 };
+	const uint8_t active[] = { 0x82, PHYS_ADDR >> 8, PHYS_ADDR & 0xff };
+	const uint8_t menu_on[] = { 0x8e, 0x00 };
 
+	if (c.pa == 0xffff) {
+		return;
+	}
 	send(BROADCAST, report_pa, sizeof(report_pa));
 	send(BROADCAST, vendor, sizeof(vendor));
 	send(0, view_on, sizeof(view_on));
@@ -299,11 +308,14 @@ handle(const uint8_t *m, int n)
 		send(BROADCAST, r, 4);
 		return;
 	case 0x85:              /* Request Active Source */
+		if (c.pa == 0xffff) {
+			return;
+		}
 		r[0] = 0x82; r[1] = PHYS_ADDR >> 8; r[2] = PHYS_ADDR & 0xff;
 		send(BROADCAST, r, 3);
 		return;
 	case 0x86:              /* Set Stream Path */
-		if (n >= 4 && (m[2] << 8 | m[3]) == PHYS_ADDR) {
+		if (n >= 4 && c.pa != 0xffff && (uint32_t)(m[2] << 8 | m[3]) == PHYS_ADDR) {
 			r[0] = 0x82; r[1] = PHYS_ADDR >> 8; r[2] = PHYS_ADDR & 0xff;
 			send(BROADCAST, r, 3);
 			r[0] = 0x8e; r[1] = 0x00;
@@ -388,8 +400,9 @@ cec_thread(__unused void *arg, __unused wait_result_t wr_)
 	if (c.la == 15) {
 		printf("cec: no address of a playback device is free; listening only\n");
 	} else {
-		printf("cec: logical address %d, physical address %x.%x.%x.%x\n", c.la, PHYS_ADDR >> 12,
-		    (PHYS_ADDR >> 8) & 0xf, (PHYS_ADDR >> 4) & 0xf, PHYS_ADDR & 0xf);
+		printf("cec: logical address %d, physical address %x.%x.%x.%x%s\n", c.la, PHYS_ADDR >> 12,
+		    (PHYS_ADDR >> 8) & 0xf, (PHYS_ADDR >> 4) & 0xf, PHYS_ADDR & 0xf,
+		    c.pa == 0xffff ? " (not known: not claiming the TV's input)" : "");
 		announce();
 	}
 	for (;;) {
@@ -425,6 +438,17 @@ hakios_cec_init(void)
 	c.clk = ml_io_map(CLK_BASE, 0x1000);
 	c.pad = ml_io_map(PAD_BASE, 0x1000);
 	c.la = 15;
+	c.pa = 0xffff;
+	if (!PE_parse_boot_argn("cec_pa", &c.pa, sizeof(c.pa))) {
+		vm_offset_t sys = ml_io_map(SYSCTRL_STATUS_REG1 & ~0xfffUL, 0x1000);
+
+		v = rd32(sys, SYSCTRL_STATUS_REG1 & 0xfff) & 0xffff;
+		printf("cec: physical address Linux left: %#x\n", v);
+		if (v != 0 && v != 0xffff) {
+			c.pa = v;
+		}
+	}
+	c.pa &= 0xffff;
 
 	/* the bus clock, then 32768 Hz from the 24 MHz crystal: dual divider n1 733, n2 732, m1 8, m2 11 */
 	wr32(c.clk, CLK_SYS_EN0, rd32(c.clk, CLK_SYS_EN0) | 1u << 16);
