@@ -20,3 +20,6 @@ driver BUTTONS
 
 standard bsd/dev/hakios.crgudc.c
 	help    the Amlogic box's USB port as a device: keys from the host (usbkeys=1)
+
+standard bsd/dev/hakios.cec.c
+	help    the Amlogic box's HDMI-CEC: the TV's remote as the box's (cec=1)
