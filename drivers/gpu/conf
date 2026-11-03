@@ -10,3 +10,6 @@ driver ADRENO
 
 standard iokit/Kernel/hakios.mali.cpp iokitcpp
 	help    the Mali-G310 of the Amlogic box (mali=N): Ken-u's Mali-G610 CSF driver with the S7D's clocks; fw/mali_csffw.bin
+
+standard bsd/dev/hakios.hdmitx.c
+	help    the Amlogic box's HDMI transmitter (hdmitx=1): the mode U-Boot left and the TV's EDID, read through the SiP calls

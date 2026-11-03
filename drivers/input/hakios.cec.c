@@ -10,8 +10,8 @@
  * reached one byte at a time through AO_CECB_RW_REG. The 32.768 kHz clock and the GPIOH_3 pin are set here
  * as Linux's clock and pinctrl drivers would, in case the firmware left them otherwise.
  *
- * The physical address (which of the TV's inputs the box is on) comes from the TV's EDID; with no EDID reader
- * yet it is boot-arg cec_pa (e.g. cec_pa=0x2000 for input 2), else the one Linux's driver last left in
+ * The physical address (which of the TV's inputs the box is on) is boot-arg cec_pa (e.g. cec_pa=0x2000 for input
+ * 2), else the TV's EDID as hakios.hdmitx.c read it (hdmitx=1), else the one Linux's driver last left in
  * SYSCTRL_STATUS_REG1. Without one the box never claims to be the active source: the TV would switch to
  * an input that is not the box's ("no signal").
  */
@@ -23,6 +23,7 @@
 #include <sys/systm.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.cec.h>
+#include <sys/hakios.hdmitx.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void IOSleep(unsigned int milliseconds);
@@ -441,7 +442,9 @@ hakios_cec_init(void)
 	c.pad = ml_io_map(PAD_BASE, 0x1000);
 	c.la = 15;
 	c.pa = 0xffff;
-	if (!PE_parse_boot_argn("cec_pa", &c.pa, sizeof(c.pa))) {
+	if (!PE_parse_boot_argn("cec_pa", &c.pa, sizeof(c.pa)) && (c.pa = hakios_hdmitx_physical_address()) != 0xffff) {
+		printf("cec: physical address from the TV's EDID\n");
+	} else if (c.pa == 0xffff) {
 		vm_offset_t sys = ml_io_map(SYSCTRL_STATUS_REG1 & ~0xfffUL, 0x1000);
 
 		v = rd32(sys, SYSCTRL_STATUS_REG1 & 0xfff) & 0xffff;
