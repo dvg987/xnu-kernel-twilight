@@ -16,3 +16,8 @@ driver WIFI
 
 standard bsd/dev/hakios.xhci.c
 	help    the Amlogic box's internal USB host and the W2 Wi-Fi/Bluetooth chip on it (w2=N)
+
+standard bsd/dev/hakios.w2.c
+	help    the W2's Wi-Fi (w2=6): its firmware's messages, frames in and out, the station, en0
+standard bsd/dev/hakios.w2wpa.c
+	help    WPA2 with a passphrase for the W2's station (wifi/lx/src/lx_wpa.c)

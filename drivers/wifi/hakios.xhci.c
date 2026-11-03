@@ -6,7 +6,9 @@
  *   2  the W2 enumerated: address, descriptors, configuration; endpoint 1 OUT and 4 IN (commands, answers)
  *   3  a register of the chip read, by a vendor request on endpoint 0 and by a command on endpoints 1/4
  *   4  the Wi-Fi firmware loaded (fw/w2_iccm.bin, w2_dccm1.bin, w2_dccm2.bin of the small image, made by
- *      tools/w2-fw.py) and started; the chip ready when it answers its vendor id at 0x00a10004
+ *      tools/w2-fw.py) and started, with the radio's AGC microcode (fw/w2_agc.bin) before it; the chip ready when it
+ *      answers its vendor id at 0x00a10004
+ *   5+ the Wi-Fi driver on top (hakios.w2.c), through the calls of sys/hakios.xhci.h
  *
  * One device, polled from a kernel thread, no interrupt: a ring of commands, one of events, one for each endpoint
  * used, contexts and buffers in one physically contiguous block below 4 GB (the controller has no 64-bit
@@ -22,6 +24,7 @@
 #include <sys/systm.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.xhci.h>
+#include <kern/locks.h>
 #include <vm/vm_kern.h>
 #include <arm/caches_internal.h>
 
@@ -106,13 +109,17 @@ extern void IODelay(unsigned int microseconds);
 #define OFF_CTRL_BUF    0x0a000
 #define OFF_CBW         0x0b000
 #define OFF_IN_BUF      0x0c000
+#define OFF_EP5_IN      0x0d000
+#define OFF_CFM         0x0e000                 /* 2 KiB: the TX confirmations */
 #define OFF_SCRATCH     0x10000                 /* up to 32 pages */
-#define OFF_DATA        0x30000                 /* 64 KiB, one transfer of the firmware */
+#define OFF_DATA        0x30000                 /* 64 KiB: one transfer of the firmware, of an SRAM read or write */
+#define OFF_TX          0x40000                 /* 64 KiB: the pages of one packet command */
 #define MAX_SCRATCH     32
 
 #define DCI_EP0         1
 #define DCI_EP1_OUT     2
 #define DCI_EP4_IN      9
+#define DCI_EP5_IN      11
 
 /* the W2's commands (aml_bus/usb_common.h) */
 #define W2_SIG          0x43425355
@@ -121,6 +128,10 @@ extern void IODelay(unsigned int microseconds);
 #define W2_START        0xc2
 #define W2_READ_REG     0xc4
 #define W2_WRITE_REG    0xc5
+#define W2_WRITE_PACKET 0xc7
+#define W2_WRITE_SRAM   0xc8
+#define W2_READ_SRAM    0xc9
+#define W2_USB_IRQ      0xcd
 #define W2_VENDOR_ID_REG 0x00a10004
 #define W2_VENDOR_ID    0x1b8e
 
@@ -135,11 +146,16 @@ static struct {
 	uint64_t pa;
 	vm_offset_t op, rt, db;
 	uint32_t ctx_size, ports, step;
-	struct ring cmd, ep0, ep1, ep4;
+	struct ring cmd, ep0, ep1, ep4, ep5;
 	uint32_t ev_idx, ev_cycle;
 	uint32_t slot, port, speed;
 	uint32_t ev[4];         /* the last event taken */
+	uint16_t irq_count;     /* wIndex of the interrupt poll: a counter */
+	bool ready;             /* the firmware is up: the calls of sys/hakios.xhci.h may be made */
 } x;
+
+static LCK_GRP_DECLARE(xhci_lck_grp, "hakios-xhci");
+static LCK_MTX_DECLARE(xhci_lock, &xhci_lck_grp);       /* all traffic on the bus: one transfer at a time */
 
 static inline uint32_t rd(vm_offset_t base, uint32_t off) { return *(volatile uint32_t *)(base + off); }
 static inline void wr(vm_offset_t base, uint32_t off, uint32_t v) { *(volatile uint32_t *)(base + off) = v; }
@@ -595,20 +611,22 @@ enumerate(void)
 	for (uint32_t i = 0; i < 0x1000 / 4; i++) {
 		mem32(OFF_IN_CTX)[i] = 0;
 	}
-	in_ctx(0)[1] = 1u << 0 | 1u << DCI_EP1_OUT | 1u << DCI_EP4_IN;
-	in_ctx(1)[0] = x.speed << 20 | (uint32_t)DCI_EP4_IN << 27;
+	in_ctx(0)[1] = 1u << 0 | 1u << DCI_EP1_OUT | 1u << DCI_EP4_IN | 1u << DCI_EP5_IN;
+	in_ctx(1)[0] = x.speed << 20 | (uint32_t)DCI_EP5_IN << 27;
 	in_ctx(1)[1] = x.port << 16;
 	ring_init(&x.ep1, OFF_EP1_OUT);
 	ring_init(&x.ep4, OFF_EP4_IN);
+	ring_init(&x.ep5, OFF_EP5_IN);
 	ep_ctx(DCI_EP1_OUT, 2, 512, &x.ep1, 1024);
 	ep_ctx(DCI_EP4_IN, 6, 512, &x.ep4, 1024);
+	ep_ctx(DCI_EP5_IN, 6, 512, &x.ep5, 1024);
 	__builtin_arm_dsb(0xf);
 	cc = command(pa32(OFF_IN_CTX), 0, 0, TRB_TYPE(TRB_CONFIGURE) | x.slot << 24);
 	if (cc != CC_SUCCESS) {
 		printf("xhci: configure endpoint: completion %u\n", cc);
 		return false;
 	}
-	printf("xhci: configured; endpoints 1 OUT and 4 IN ready\n");
+	printf("xhci: configured; endpoints 1 OUT, 4 IN and 5 IN ready\n");
 	return true;
 }
 
@@ -660,6 +678,211 @@ w2_write(uint32_t addr, uint32_t value)
 {
 	w2_cbw(false, 0, W2_WRITE_REG, addr, value, 4);
 	return bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) == 512;
+}
+
+/* between the block (device memory to us: no memcpy, whose wide or unaligned accesses may fault) and memory */
+static void
+dma_put(uint32_t off, const uint8_t *src, uint32_t n)
+{
+	uint32_t i = 0;
+
+	for (; i + 4 <= n; i += 4) {
+		mem32(off)[i / 4] = src[i] | src[i + 1] << 8 | src[i + 2] << 16 | (uint32_t)src[i + 3] << 24;
+	}
+	for (; i < n; i++) {
+		((volatile uint8_t *)(x.blk + off))[i] = src[i];
+	}
+	__builtin_arm_dsb(0xf);
+}
+
+static void
+dma_get(uint32_t off, uint8_t *dst, uint32_t n)
+{
+	uint32_t i = 0;
+
+	for (; i + 4 <= n; i += 4) {
+		uint32_t w = mem32(off)[i / 4];
+
+		dst[i] = (uint8_t)w;
+		dst[i + 1] = (uint8_t)(w >> 8);
+		dst[i + 2] = (uint8_t)(w >> 16);
+		dst[i + 3] = (uint8_t)(w >> 24);
+	}
+	for (; i < n; i++) {
+		dst[i] = ((volatile uint8_t *)(x.blk + off))[i];
+	}
+}
+
+/* `n' bytes into the chip's memory at `addr', in pieces of 64 KiB: a write-SRAM command, then the data */
+static bool
+sram_write(uint32_t addr, const uint8_t *src, uint32_t n)
+{
+	for (uint32_t done = 0; done < n;) {
+		uint32_t piece = n - done > 0x10000 ? 0x10000 : n - done;
+
+		w2_cbw(false, piece, W2_WRITE_SRAM, addr + done, 0, piece);
+		if (bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) != 512) {
+			return false;
+		}
+		dma_put(OFF_DATA, src + done, piece);
+		if (bulk(DCI_EP1_OUT, &x.ep1, OFF_DATA, piece, 3000) != (int)piece) {
+			return false;
+		}
+		done += piece;
+	}
+	return true;
+}
+
+static bool
+sram_read(uint32_t addr, uint8_t *dst, uint32_t n)
+{
+	for (uint32_t done = 0; done < n;) {
+		uint32_t piece = n - done > 0x10000 ? 0x10000 : n - done;
+		int got;
+
+		w2_cbw(true, piece, W2_READ_SRAM, addr + done, 0, piece);
+		if (bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) != 512) {
+			return false;
+		}
+		got = bulk(DCI_EP4_IN, &x.ep4, OFF_DATA, piece, 3000);
+		if (got != (int)piece) {
+			return false;
+		}
+		dma_get(OFF_DATA, dst + done, piece);
+		done += piece;
+	}
+	return true;
+}
+
+/* ---- for the Wi-Fi driver (sys/hakios.xhci.h): each a whole exchange, under the lock ---- */
+
+bool
+hakios_w2_read(uint32_t addr, uint32_t *value)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	ok = x.ready && w2_read(addr, value);
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+bool
+hakios_w2_write(uint32_t addr, uint32_t value)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	ok = x.ready && w2_write(addr, value);
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+bool
+hakios_w2_sram_write(uint32_t addr, const void *data, uint32_t length)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	ok = x.ready && sram_write(addr, data, length);
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+bool
+hakios_w2_sram_read(uint32_t addr, void *data, uint32_t length)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	ok = x.ready && sram_read(addr, data, length);
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+/* the chip's "interrupt": a vendor request on endpoint 0 whose index counts up; four words back */
+bool
+hakios_w2_irq(uint32_t words[4])
+{
+	uint8_t b[16];
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	ok = x.ready && control(0xc2, W2_USB_IRQ, 0, x.irq_count, 16) == 16;
+	if (ok) {
+		dma_get(OFF_CTRL_BUF, b, 16);
+		for (int i = 0; i < 4; i++) {
+			words[i] = b[4 * i] | b[4 * i + 1] << 8 | b[4 * i + 2] << 16 | (uint32_t)b[4 * i + 3] << 24;
+		}
+	}
+	x.irq_count++;
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+/* pages of frames (txdesc_host + payload each, padded to 4), `count' <= 25: the packet command, then all the pages */
+bool
+hakios_w2_packets(const void *pages, const uint16_t *sizes, unsigned count)
+{
+	volatile uint8_t *b = (volatile uint8_t *)(x.blk + OFF_CBW);
+	uint32_t total = 0;
+	bool ok;
+
+	if (count == 0 || count > 25) {
+		return false;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		total += sizes[i];
+	}
+	if (total > 0x10000) {
+		return false;
+	}
+	lck_mtx_lock(&xhci_lock);
+	for (int i = 0; i < 512; i++) {
+		b[i] = 0;
+	}
+	/* the sizes are laid over the command block where its fields are not looked at (w2_usb.c, auc_send_frame) */
+	for (unsigned i = 0; i < count; i++) {
+		uint32_t at = i < 6 ? 2 * i : i < 12 ? 19 + 2 * (i - 6) : i == 12 ? 17 : i == 13 ? 13 : 31 + 2 * (i - 14);
+
+		if (i == 13) {
+			b[13] = (uint8_t)(sizes[i] >> 8);
+			b[14] = (uint8_t)sizes[i];
+		} else {
+			b[at] = (uint8_t)sizes[i];
+			b[at + 1] = (uint8_t)(sizes[i] >> 8);
+		}
+	}
+	b[12] = (uint8_t)count;
+	b[15] = W2_WRITE_PACKET;
+	__builtin_arm_dsb(0xf);
+	ok = x.ready && bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) == 512;
+	if (ok) {
+		dma_put(OFF_TX, pages, total);
+		ok = bulk(DCI_EP1_OUT, &x.ep1, OFF_TX, total, 3000) == (int)total;
+	}
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+/* the ring of TX confirmations, as it is now (endpoint 5, no command) */
+bool
+hakios_w2_confirmations(void *data, uint32_t length)
+{
+	int got = -1;
+
+	if (length > 2048) {
+		return false;
+	}
+	lck_mtx_lock(&xhci_lock);
+	if (x.ready) {
+		got = bulk(DCI_EP5_IN, &x.ep5, OFF_CFM, length, 3000);
+		if (got > 0) {
+			dma_get(OFF_CFM, data, (uint32_t)got);
+		}
+	}
+	lck_mtx_unlock(&xhci_lock);
+	return got == (int)length;
 }
 
 /* step 3 */
@@ -747,6 +970,58 @@ w2_bbpll(void)
 	return (v >> 31) != 0;
 }
 
+/* the bus between the MAC and the PHY, and the radio's AGC microcode (aml_plat_mpif_sel, aml_plat_agc_load) */
+static bool
+w2_mpif_agc(void)
+{
+	uint32_t sig = 0, cfg = 0, rf, agc, clk, ver = 0, agcctl = 0, memclk = 0, v = 0;
+	uint64_t size = 0;
+	const uint8_t *ucode = hakios_image_file("fw", "w2_agc.bin", &size, NULL);
+
+	w2_read(0x60801000, &sig);
+	if ((sig >> 16) != 0xcafe && (sig >> 16) != 0xc0ca && (sig & 0xf) < 3) {
+		w2_write(0x60c10030, 0x3);
+	}
+	w2_read(0x60c00000, &cfg);
+	rf = (cfg >> 16) & 0xf;
+	if (rf > 2) {
+		printf("xhci: w2: unknown radio type %u (%#x)\n", rf, cfg);
+		return false;
+	}
+	agc = rf == 0 ? 0x60c02060 : 0x60c0b390;
+	clk = rf == 0 ? 0x60c00848 : (sig >> 16) == 0xc0ca ? 0x60805010 : 0x60c00874;
+	if (rf != 0) {
+		w2_read(0x60c0b000, &v);
+		ver = (v >> 22) & 3;
+	}
+	if (ucode == NULL || size != 2048) {
+		printf("xhci: w2: no fw/w2_agc.bin of 2048 bytes in the small image\n");
+		return false;
+	}
+	w2_read(clk, &memclk);
+	w2_read(agc, &agcctl);
+	w2_write(agc, agcctl | 1u << 12);
+	w2_write(clk, ver > 0 ? memclk | 1u << 29 : memclk & ~(1u << 3));
+	if (!sram_write(0x60c0a000, ucode, 2048)) {
+		return false;
+	}
+	if (ver == 1) {
+		w2_write(0x60c0b008, 1u << 28);
+		for (int i = 0; i < 1000 && w2_read(0x60c0b008, &v) && (v & (1u << 28)); i++) {
+			IODelay(10);
+		}
+		w2_read(0x60c0b238, &v);
+		if (!(v & 1)) {
+			w2_read(0x60c0b23c, &v);
+			printf("xhci: w2: the AGC memory does not check (signature %#x)\n", v);
+		}
+	}
+	w2_write(clk, ver > 0 ? memclk & ~(1u << 29) : memclk | 1u << 3);
+	w2_write(agc, agcctl & ~(1u << 12));
+	printf("xhci: w2: radio type %u, AGC microcode (version %u) loaded\n", rf, ver);
+	return true;
+}
+
 /* step 4 */
 static bool
 w2_firmware(void)
@@ -773,6 +1048,9 @@ w2_firmware(void)
 	w2_write(0x608010e0, misc & ~2u);
 	IOSleep(10);
 
+	if (!w2_mpif_agc()) {
+		return false;
+	}
 	if (!w2_download("w2_iccm.bin", 0x00040000) || !w2_download("w2_dccm1.bin", 0x00d00000) ||
 	    !w2_download("w2_dccm2.bin", 0x00d28000)) {
 		return false;
@@ -808,7 +1086,11 @@ xhci_thread(__unused void *arg, __unused wait_result_t wr_)
 	if (!w2_registers() || x.step < 4) {
 		return;
 	}
-	w2_firmware();
+	if (!w2_firmware() || x.step < 5) {
+		return;
+	}
+	x.ready = true;
+	hakios_w2_run(x.step);          /* hakios.w2.c: does not return */
 }
 
 void
