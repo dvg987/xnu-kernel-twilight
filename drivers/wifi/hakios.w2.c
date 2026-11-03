@@ -452,7 +452,14 @@ rx_process(uint32_t r)
 	}
 	/* and walk its records */
 	for (cur = w.tail; (cur & 0x7fffffffu) != b || (cur >> 31) != (head >> 31);) {
-		uint32_t at = cur & 0x7fffffffu, next = le32(ring_at(at) + 76), phase = cur & (1u << 31);
+		uint32_t at = cur & 0x7fffffffu, next, phase = cur & (1u << 31);
+
+		/* no record begins in the ring's last 128 bytes: the next one is at its start */
+		if (at + 128 > w.end) {
+			cur = RX_START | (phase ^ (1u << 31));
+			continue;
+		}
+		next = le32(ring_at(at) + 76);
 
 		if (next < RX_START || next >= w.end) {
 			printf("w2: rx ring: a record at %#x points at %#x; skipping to the head\n", at, next);
@@ -686,6 +693,9 @@ message_received(const uint8_t *m)
 		printf("w2: the firmware reports an error\n");
 		break;
 	case MM_CHANNEL_SWITCH_IND:
+	case 0x0028: case 0x0029: case 0x002a: case 0x002b:   /* block ack sessions: no reordering here */
+	case 0x004f:                                            /* a channel's survey, during a scan */
+	case 0x4019:
 		break;
 	default:
 		if (w.messages_in < 200) {
