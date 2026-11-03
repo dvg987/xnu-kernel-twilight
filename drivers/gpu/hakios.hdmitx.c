@@ -91,7 +91,15 @@ static struct {
 	uint8_t edid[HAKIOS_HDMITX_EDID_MAX];
 	unsigned edid_length;
 	uint32_t physical_address;
-} h = { .physical_address = 0xffff };
+	uint8_t vics[64];                       /* the video codes the TV lists */
+	unsigned vic_count;
+	uint32_t max_tmds_khz;                  /* the TV's (HF-VSDB, else the HDMI VSDB, else 165 MHz) */
+	bool ycbcr420;                          /* takes 4:2:0 (a 4:2:0 capability map or 4:2:0-only codes) */
+	bool pq, hlg, bt2020;                   /* ST 2084, HLG, BT.2020 YCC */
+	struct hakios_hdmitx_timing timings[HAKIOS_HDMITX_TIMINGS_MAX];
+	unsigned timing_count;
+	char name[14];
+} h = { .physical_address = 0xffff, .max_tmds_khz = 165000 };
 
 static uint64_t
 sip(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
@@ -283,23 +291,38 @@ parse_cta(const uint8_t *b)
 			for (unsigned k = 0; k < len && at < sizeof(vics) - 6; k++) {
 				unsigned vic = p[k] >= 129 && p[k] <= 192 ? p[k] & 0x7f : p[k];
 
+				if (h.vic_count < sizeof(h.vics)) {
+					h.vics[h.vic_count++] = (uint8_t)vic;
+				}
+
 				at += snprintf(vics + at, sizeof(vics) - at, " %u%s", vic, p[k] >= 129 && p[k] <= 192 ? "*" : "");
 			}
 		} else if (tag == 3 && len >= 5 && p[0] == 0x03 && p[1] == 0x0c && p[2] == 0x00) {   /* HDMI 1.4 VSDB */
 			h.physical_address = (uint32_t)p[3] << 8 | p[4];
+			if (len >= 7 && p[6] * 5000u > h.max_tmds_khz) {
+				h.max_tmds_khz = p[6] * 5000u;
+			}
 			printf("hdmitx: HDMI VSDB: physical address %x.%x.%x.%x, deep colour %#x, max TMDS %u MHz\n", p[3] >> 4,
 			    p[3] & 15, p[4] >> 4, p[4] & 15, len >= 6 ? p[5] : 0, len >= 7 ? p[6] * 5 : 0);
 		} else if (tag == 3 && len >= 6 && p[0] == 0xd8 && p[1] == 0x5d && p[2] == 0xc4) {   /* HDMI Forum VSDB */
+			if (p[4] * 5000u > h.max_tmds_khz) {
+				h.max_tmds_khz = p[4] * 5000u;
+			}
 			printf("hdmitx: HF-VSDB: max TMDS %u MHz, SCDC %u, 4:2:0 deep colour %#x\n", p[4] * 5, !!(p[5] & 0x80),
 			    len >= 7 ? p[6] & 7 : 0);
 		} else if (tag == 7 && len >= 3 && p[0] == 0x06) {                      /* HDR static metadata */
+			h.pq = (p[1] & 4) != 0;
+			h.hlg = (p[1] & 8) != 0;
 			printf("hdmitx: HDR static metadata: EOTF SDR %u HDR-gamma %u PQ (HDR10) %u HLG %u, type 1 %u, max %u min %u\n",
 			    p[1] & 1, !!(p[1] & 2), !!(p[1] & 4), !!(p[1] & 8), p[2] & 1, len >= 4 ? p[3] : 0, len >= 6 ? p[5] : 0);
 		} else if (tag == 7 && len >= 1 && p[0] == 0x0e) {
+			h.ycbcr420 = true;
 			printf("hdmitx: YCbCr 4:2:0-only video data block (%u codes)\n", len - 1);
 		} else if (tag == 7 && len >= 1 && p[0] == 0x0f) {
+			h.ycbcr420 = true;
 			printf("hdmitx: YCbCr 4:2:0 capability map (%u bytes)\n", len - 1);
 		} else if (tag == 7 && len >= 2 && p[0] == 0x05) {
+			h.bt2020 = (p[1] & 0x80) != 0;
 			printf("hdmitx: colorimetry: BT.2020 YCC %u RGB %u\n", !!(p[1] & 0x80), !!(p[1] & 0x40));
 		} else if (tag == 3 && len >= 3 && p[0] == 0x46 && p[1] == 0xd0 && p[2] == 0x00) {
 			printf("hdmitx: Dolby Vision VSVDB (%u bytes)\n", len);
@@ -317,7 +340,7 @@ read_edid(void)
 {
 	uint8_t *b = h.edid;
 	unsigned blocks;
-	char name[14] = "";
+	char *name = h.name;
 
 	if (!edid_block(0, b) || b[0] != 0x00 || b[1] != 0xff || !checksum_ok(b)) {
 		printf("hdmitx: no EDID (block 0 %s)\n", b[1] == 0xff ? "has a bad checksum" : "unreadable");
@@ -356,6 +379,134 @@ read_edid(void)
 	}
 }
 
+/*
+ * The CTA-861 timings the box drives (Amlogic's hdmitx21 timing table; the 1/1.001 rates are the same timings with a
+ * pixel clock 1000/1001 of theirs, which the PLL's fraction makes), the colour formats, and from the EDID which of
+ * them this TV takes: its own video codes, the 1/1.001 twin of each code at 24, 30 or 60 Hz, and the TMDS rate it
+ * allows (8-bit: the pixel clock; 10-bit x 5/4, 12-bit x 3/2; 4:2:2 is a 12-bit container at x 1; 4:2:0 halves).
+ */
+static const struct {
+	uint8_t vic;
+	uint16_t width, height, htotal, vtotal;
+	uint32_t pixel_khz;
+	uint8_t hz;
+	bool fractional;                        /* has a 1/1.001 twin */
+} cta[] = {
+	{ 4, 1280, 720, 1650, 750, 74250, 60, true },
+	{ 19, 1280, 720, 1980, 750, 74250, 50, false },
+	{ 32, 1920, 1080, 2750, 1125, 74250, 24, true },
+	{ 33, 1920, 1080, 2640, 1125, 74250, 25, false },
+	{ 34, 1920, 1080, 2200, 1125, 74250, 30, true },
+	{ 31, 1920, 1080, 2640, 1125, 148500, 50, false },
+	{ 16, 1920, 1080, 2200, 1125, 148500, 60, true },
+	{ 93, 3840, 2160, 5500, 2250, 297000, 24, true },
+	{ 94, 3840, 2160, 5280, 2250, 297000, 25, false },
+	{ 95, 3840, 2160, 4400, 2250, 297000, 30, true },
+	{ 96, 3840, 2160, 5280, 2250, 594000, 50, false },
+	{ 97, 3840, 2160, 4400, 2250, 594000, 60, true },
+};
+
+const struct hakios_hdmitx_color hakios_hdmitx_colors[HAKIOS_HDMITX_COLORS] = {
+	/* id, encoding (0 RGB, 1 4:2:0, 2 4:2:2, 3 4:4:4), depth, colorimetry (1 BT.709, 7 BT.2020 YCC, 16 default RGB),
+	 * EOTF (0 SDR, 2 PQ, 3 HLG), range (0 full, 1 limited) */
+	{ 1, 0, 8, 16, 0, 0 },                  /* SDR RGB, full range */
+	{ 2, 3, 8, 1, 0, 1 },                   /* SDR YCbCr 4:4:4 */
+	{ 3, 2, 12, 1, 0, 1 },                  /* SDR YCbCr 4:2:2 12-bit */
+	{ 4, 1, 8, 1, 0, 1 },                   /* SDR YCbCr 4:2:0 */
+	{ 5, 2, 12, 7, 2, 1 },                  /* HDR10 YCbCr 4:2:2 12-bit */
+	{ 6, 1, 10, 7, 2, 1 },                  /* HDR10 YCbCr 4:2:0 10-bit */
+	{ 7, 3, 10, 7, 2, 1 },                  /* HDR10 YCbCr 4:4:4 10-bit */
+	{ 8, 0, 10, 9, 2, 0 },                  /* HDR10 RGB 10-bit (9: BT.2020 RGB) */
+};
+
+static uint32_t
+tmds_khz(uint32_t pixel_khz, const struct hakios_hdmitx_color *c)
+{
+	if (c->encoding == 2) {
+		return pixel_khz;
+	}
+	pixel_khz = c->depth == 12 ? pixel_khz * 3 / 2 : c->depth == 10 ? pixel_khz * 5 / 4 : pixel_khz;
+	return c->encoding == 1 ? pixel_khz / 2 : pixel_khz;
+}
+
+static bool
+tv_has(unsigned vic)
+{
+	for (unsigned i = 0; i < h.vic_count; i++) {
+		if (h.vics[i] == vic) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+make_timings(void)
+{
+	h.timing_count = 0;
+	for (unsigned i = 0; i < sizeof(cta) / sizeof(cta[0]); i++) {
+		if (!tv_has(cta[i].vic)) {
+			continue;
+		}
+		for (unsigned twin = 0; twin <= (cta[i].fractional ? 1u : 0u); twin++) {
+			struct hakios_hdmitx_timing *t = &h.timings[h.timing_count];
+			uint32_t colors = 0;
+
+			if (h.timing_count == HAKIOS_HDMITX_TIMINGS_MAX) {
+				break;
+			}
+			t->id = (uint16_t)(1 + h.timing_count);
+			t->vic = cta[i].vic;
+			t->width = cta[i].width;
+			t->height = cta[i].height;
+			t->htotal = cta[i].htotal;
+			t->vtotal = cta[i].vtotal;
+			t->fractional = twin != 0;
+			t->pixel_khz = twin ? (uint32_t)((uint64_t)cta[i].pixel_khz * 1000 / 1001) : cta[i].pixel_khz;
+			t->rate = twin ? (uint32_t)(((uint64_t)cta[i].hz << 16) * 1000 / 1001) : (uint32_t)cta[i].hz << 16;
+			for (unsigned c = 0; c < HAKIOS_HDMITX_COLORS; c++) {
+				const struct hakios_hdmitx_color *k = &hakios_hdmitx_colors[c];
+
+				if (tmds_khz(cta[i].pixel_khz, k) > h.max_tmds_khz || tmds_khz(cta[i].pixel_khz, k) > 600000) {
+					continue;
+				}
+				if (k->encoding == 1 && (!h.ycbcr420 || t->height < 2160 || cta[i].hz < 50)) {
+					continue;               /* 4:2:0: only where 4:4:4 does not fit, as Apple's modes */
+				}
+				if (k->eotf == 2 && !(h.pq && h.bt2020)) {
+					continue;
+				}
+				colors |= 1u << (k->id - 1);
+			}
+			t->colors = colors;
+			h.timing_count++;
+		}
+	}
+	for (unsigned i = 0; i < h.timing_count; i++) {
+		const struct hakios_hdmitx_timing *t = &h.timings[i];
+
+		printf("hdmitx: timing %u: %ux%u @ %u.%03u Hz (VIC %u%s), %u kHz, colours %#x\n", t->id, t->width, t->height,
+		    t->rate >> 16, (unsigned)(((uint64_t)(t->rate & 0xffff) * 1000) >> 16), t->vic, t->fractional ? " /1.001" : "",
+		    t->pixel_khz, t->colors);
+	}
+}
+
+const struct hakios_hdmitx_timing *
+hakios_hdmitx_timings(unsigned *count)
+{
+	*count = h.timing_count;
+	return h.timing_count ? h.timings : NULL;
+}
+
+const char *
+hakios_hdmitx_tv(bool *pq, bool *hlg, bool *bt2020)
+{
+	*pq = h.pq;
+	*hlg = h.hlg;
+	*bt2020 = h.bt2020;
+	return h.name;
+}
+
 const uint8_t *
 hakios_hdmitx_edid(unsigned *length)
 {
@@ -387,4 +538,5 @@ hakios_hdmitx_init(void)
 	}
 	show_state();
 	read_edid();
+	make_timings();
 }

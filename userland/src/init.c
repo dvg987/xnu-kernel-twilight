@@ -213,6 +213,15 @@ flash_root(const char *dev)
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
 	}
+	if (stat(in_image("/ext"), &fw_st) == 0) {
+		/* our bundles beside the volume's own in /System/Library/Extensions: the GPU's Metal plug-in, which Metal
+		 * loads from there by the name the accelerator service gives (MetalPluginName) */
+		ok = mount("bindfs", "/flash/System/Library/Extensions", MNT_RDONLY | MNT_UNION, (void *)in_image("/ext")) == 0;
+		if (!ok) {
+			printf("  bindfs %s on /flash/System/Library/Extensions, union: %s\n", in_image("/ext"), strerror(errno));
+		}
+		check(ok, "our bundles in /System/Library/Extensions, over the volume's own");
+	}
 	if (stat("/jb-bin", &fw_st) == 0) {
 		/*
 		 * The package manager's prefix is in the boot volume (/jb), and Sileo runs mv, cp, rm, mkdir
