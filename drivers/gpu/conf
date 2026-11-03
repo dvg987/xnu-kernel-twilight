@@ -7,3 +7,6 @@ driver ADRENO
 	file    iokit/Kernel/hakios.gpu.cpp iokitcpp
 	help    the Adreno 642L of the SC7280 woken step by step (adreno=N), and HakiosGPU, the IOKit service Mesa and
 	help    the window server draw through (gpu=1, adreno_keep=1). Needs the GPU's firmware from the phone (fw-gpu/)
+
+standard iokit/Kernel/hakios.mali.cpp iokitcpp
+	help    the Mali-G310 of the Amlogic box (mali=N): Ken-u's Mali-G610 CSF driver with the S7D's clocks; fw/mali_csffw.bin

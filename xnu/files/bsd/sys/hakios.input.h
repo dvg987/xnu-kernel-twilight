@@ -48,6 +48,7 @@ bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
 int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes); /* for drivers */
 /* a file of one of the RAM disks (drivers/storage/hakios.image.c): fw/<name> is the firmware userland/build.sh put there */
 const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+void mali_start(void);               /* boot-arg mali=N: the Amlogic box's Mali-G310 (drivers/gpu/hakios.mali.cpp) */
 void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
 /* one transfer at a time through the PMIC arbiter for this system (drivers/input/hakios.buttons.c) */
