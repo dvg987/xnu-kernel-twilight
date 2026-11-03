@@ -1259,6 +1259,7 @@ start_thread(__unused void *arg, __unused wait_result_t wr_)
 	}
 	w.phase = HAKIOS_STA_IDLE;
 	hakios_sta_attach(&sta_ops);
+	hakios_w2bt_start();                                    /* Bluetooth, on the same chip, once Wi-Fi is up */
 	printf("w2: en0 is the W2's; the station is there\n");
 	/* the network of fw/network of the small image (a name, a passphrase), joined now and whenever the radio comes back */
 	{

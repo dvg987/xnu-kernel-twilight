@@ -114,10 +114,14 @@ extern void IODelay(unsigned int microseconds);
 #define OFF_SCRATCH     0x10000                 /* up to 32 pages */
 #define OFF_DATA        0x30000                 /* 64 KiB: one transfer of the firmware, of an SRAM read or write */
 #define OFF_TX          0x40000                 /* 64 KiB: the pages of one packet command */
+#define OFF_EP2_OUT     0x50000                 /* Bluetooth's endpoints */
+#define OFF_EP2_IN      0x51000
 #define MAX_SCRATCH     32
 
 #define DCI_EP0         1
 #define DCI_EP1_OUT     2
+#define DCI_EP2_OUT     4
+#define DCI_EP2_IN      5
 #define DCI_EP4_IN      9
 #define DCI_EP5_IN      11
 
@@ -146,7 +150,7 @@ static struct {
 	uint64_t pa;
 	vm_offset_t op, rt, db;
 	uint32_t ctx_size, ports, step;
-	struct ring cmd, ep0, ep1, ep4, ep5;
+	struct ring cmd, ep0, ep1, ep4, ep5, ep2o, ep2i;
 	uint32_t ev_idx, ev_cycle;
 	uint32_t slot, port, speed;
 	uint32_t ev[4];         /* the last event taken */
@@ -611,22 +615,26 @@ enumerate(void)
 	for (uint32_t i = 0; i < 0x1000 / 4; i++) {
 		mem32(OFF_IN_CTX)[i] = 0;
 	}
-	in_ctx(0)[1] = 1u << 0 | 1u << DCI_EP1_OUT | 1u << DCI_EP4_IN | 1u << DCI_EP5_IN;
+	in_ctx(0)[1] = 1u << 0 | 1u << DCI_EP1_OUT | 1u << DCI_EP2_OUT | 1u << DCI_EP2_IN | 1u << DCI_EP4_IN | 1u << DCI_EP5_IN;
 	in_ctx(1)[0] = x.speed << 20 | (uint32_t)DCI_EP5_IN << 27;
 	in_ctx(1)[1] = x.port << 16;
 	ring_init(&x.ep1, OFF_EP1_OUT);
 	ring_init(&x.ep4, OFF_EP4_IN);
 	ring_init(&x.ep5, OFF_EP5_IN);
+	ring_init(&x.ep2o, OFF_EP2_OUT);
+	ring_init(&x.ep2i, OFF_EP2_IN);
 	ep_ctx(DCI_EP1_OUT, 2, 512, &x.ep1, 1024);
 	ep_ctx(DCI_EP4_IN, 6, 512, &x.ep4, 1024);
 	ep_ctx(DCI_EP5_IN, 6, 512, &x.ep5, 1024);
+	ep_ctx(DCI_EP2_OUT, 2, 512, &x.ep2o, 1024);
+	ep_ctx(DCI_EP2_IN, 6, 512, &x.ep2i, 1024);
 	__builtin_arm_dsb(0xf);
 	cc = command(pa32(OFF_IN_CTX), 0, 0, TRB_TYPE(TRB_CONFIGURE) | x.slot << 24);
 	if (cc != CC_SUCCESS) {
 		printf("xhci: configure endpoint: completion %u\n", cc);
 		return false;
 	}
-	printf("xhci: configured; endpoints 1 OUT, 4 IN and 5 IN ready\n");
+	printf("xhci: configured; endpoints 1 OUT, 4 IN, 5 IN (Wi-Fi) and 2 OUT/IN (Bluetooth) ready\n");
 	return true;
 }
 
@@ -657,16 +665,28 @@ w2_cbw(bool in, uint32_t length, uint32_t cmd, uint32_t addr, uint32_t flag, uin
 	__builtin_arm_dsb(0xf);
 }
 
+/*
+ * Which endpoints the commands go over: Wi-Fi's (1 OUT, answers on 4 IN) or Bluetooth's (2 OUT, answers on 2 IN).
+ * Set for one whole exchange, under the lock.
+ */
+struct pipe {
+	uint32_t out_dci, in_dci;
+	struct ring *out, *in;
+};
+static struct pipe pipe_wifi = { DCI_EP1_OUT, DCI_EP4_IN, &x.ep1, &x.ep4 };
+static struct pipe pipe_bt = { DCI_EP2_OUT, DCI_EP2_IN, &x.ep2o, &x.ep2i };
+static struct pipe *pp = &pipe_wifi;
+
 static bool
 w2_read(uint32_t addr, uint32_t *value)
 {
 	volatile uint8_t *in = (volatile uint8_t *)(x.blk + OFF_IN_BUF);
 
 	w2_cbw(true, 4, W2_READ_REG, addr, 0, 4);
-	if (bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) != 512) {
+	if (bulk(pp->out_dci, pp->out, OFF_CBW, 512, 3000) != 512) {
 		return false;
 	}
-	if (bulk(DCI_EP4_IN, &x.ep4, OFF_IN_BUF, 4, 3000) < 4) {
+	if (bulk(pp->in_dci, pp->in, OFF_IN_BUF, 4, 3000) < 4) {
 		return false;
 	}
 	*value = in[0] | in[1] << 8 | in[2] << 16 | (uint32_t)in[3] << 24;
@@ -677,7 +697,7 @@ static bool
 w2_write(uint32_t addr, uint32_t value)
 {
 	w2_cbw(false, 0, W2_WRITE_REG, addr, value, 4);
-	return bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) == 512;
+	return bulk(pp->out_dci, pp->out, OFF_CBW, 512, 3000) == 512;
 }
 
 /* between the block (device memory to us: no memcpy, whose wide or unaligned accesses may fault) and memory */
@@ -721,11 +741,11 @@ sram_write(uint32_t addr, const uint8_t *src, uint32_t n)
 		uint32_t piece = n - done > 0x10000 ? 0x10000 : n - done;
 
 		w2_cbw(false, piece, W2_WRITE_SRAM, addr + done, 0, piece);
-		if (bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) != 512) {
+		if (bulk(pp->out_dci, pp->out, OFF_CBW, 512, 3000) != 512) {
 			return false;
 		}
 		dma_put(OFF_DATA, src + done, piece);
-		if (bulk(DCI_EP1_OUT, &x.ep1, OFF_DATA, piece, 3000) != (int)piece) {
+		if (bulk(pp->out_dci, pp->out, OFF_DATA, piece, 3000) != (int)piece) {
 			return false;
 		}
 		done += piece;
@@ -741,10 +761,10 @@ sram_read(uint32_t addr, uint8_t *dst, uint32_t n)
 		int got;
 
 		w2_cbw(true, piece, W2_READ_SRAM, addr + done, 0, piece);
-		if (bulk(DCI_EP1_OUT, &x.ep1, OFF_CBW, 512, 3000) != 512) {
+		if (bulk(pp->out_dci, pp->out, OFF_CBW, 512, 3000) != 512) {
 			return false;
 		}
-		got = bulk(DCI_EP4_IN, &x.ep4, OFF_DATA, piece, 3000);
+		got = bulk(pp->in_dci, pp->in, OFF_DATA, piece, 3000);
 		if (got != (int)piece) {
 			return false;
 		}
@@ -883,6 +903,60 @@ hakios_w2_confirmations(void *data, uint32_t length)
 	}
 	lck_mtx_unlock(&xhci_lock);
 	return got == (int)length;
+}
+
+/* ---- the same, for Bluetooth: endpoint 2 ---- */
+
+bool
+hakios_w2bt_read(uint32_t addr, uint32_t *value)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	pp = &pipe_bt;
+	ok = x.ready && w2_read(addr, value);
+	pp = &pipe_wifi;
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+bool
+hakios_w2bt_write(uint32_t addr, uint32_t value)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	pp = &pipe_bt;
+	ok = x.ready && w2_write(addr, value);
+	pp = &pipe_wifi;
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+bool
+hakios_w2bt_sram_write(uint32_t addr, const void *data, uint32_t length)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	pp = &pipe_bt;
+	ok = x.ready && sram_write(addr, data, length);
+	pp = &pipe_wifi;
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
+}
+
+bool
+hakios_w2bt_sram_read(uint32_t addr, void *data, uint32_t length)
+{
+	bool ok;
+
+	lck_mtx_lock(&xhci_lock);
+	pp = &pipe_bt;
+	ok = x.ready && sram_read(addr, data, length);
+	pp = &pipe_wifi;
+	lck_mtx_unlock(&xhci_lock);
+	return ok;
 }
 
 /* step 3 */
