@@ -17,3 +17,6 @@ driver GOODIX
 driver BUTTONS
 	file    bsd/dev/hakios.buttons.c
 	help    the power and volume keys, read from the PMIC through the SPMI arbiter (buttons=1)
+
+standard bsd/dev/hakios.crgudc.c
+	help    the Amlogic box's USB port as a device: keys from the host (usbkeys=1)
