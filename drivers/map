@@ -70,3 +70,4 @@ bluetooth bsd/dev/hakios.bt.c
 storage  bsd/dev/hakios.emmc.c
 input    bsd/dev/hakios.crgudc.c
 input    bsd/dev/hakios.cec.c
+wifi     bsd/dev/hakios.xhci.c
