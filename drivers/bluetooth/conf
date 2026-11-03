@@ -5,3 +5,6 @@
 driver BT
 	file    bsd/dev/hakios.bt.c
 	help    the Bluetooth half of the WCN6750: step one, a read-only look at its three pins (bt=1)
+
+standard iokit/Kernel/hakios.btsvc.cpp iokitcpp
+	help    the "bluetooth" service by which Darwin's Bluetooth side finds a controller (the W2's, w2bt=3)

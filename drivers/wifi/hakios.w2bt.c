@@ -8,6 +8,15 @@
  * written over the chip's Bluetooth endpoints (hakios.xhci.c; tvos/docs/w2-bt.md). The host: one thread, polling,
  * with the least of L2CAP (signalling, ATT, SMP), ATT as a client and SMP as the initiator, for one peripheral.
  * The remote's key is kept for this boot only: it is paired again after every start (Home + "Xiaomi TV", 5 s).
+ *
+ * w2bt=3 instead: the controller for Darwin's own Bluetooth (bluetoothd, Settings): no host here, but a bridge. Darwin
+ * speaks H4 to what it believes is the Broadcom BCM4357 on the Apple TV's UART, through the kernel control
+ * com.apple.uart.bluetooth (a socket; its line settings are socket options). Commands and ACL data go to the W2 as they
+ * are, but Broadcom's own (OGF 0x3f: firmware download, baud rate, sleep mode, its tuning) are answered here as done;
+ * Read Local Version says Broadcom (15) with the BCM4357's LMP subversion, and every answer says one command may be sent
+ * at a time. The service Darwin looks for first (bluetooth, with the address) is HakiosBluetooth
+ * (drivers/bluetooth/hakios.btsvc.cpp); BlueTool, which would boot the Broadcom chip, is a stand-in that says it did
+ * (tvos/src/bluetool.c).
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -20,6 +29,11 @@
 #include <sys/systm.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.xhci.h>
+#include <sys/kern_control.h>
+#include <sys/kpi_mbuf.h>
+#include <kern/locks.h>
+
+extern void HakiosBluetoothStart(const uint8_t *address);  /* hakios.btsvc.cpp */
 
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
@@ -88,6 +102,18 @@ static struct {
 	uint32_t keyboard_down;             /* the keyboard usage down now (one) */
 	unsigned keys;
 } b;
+
+/* the bridge (w2bt=3) */
+static LCK_GRP_DECLARE(bt_lck_grp, "hakios-w2bt");
+static LCK_MTX_DECLARE(bt_lock, &bt_lck_grp);         /* the command ring and the TX table, between the two sides */
+static kern_ctl_ref uart_ref;
+static u_int32_t uart_unit;
+static volatile bool uart_connected;
+static uint8_t h4[4096];                                /* what Darwin has written of an H4 packet so far */
+static unsigned h4_length;
+static uint8_t termios[0x48];
+static unsigned vendor_answered, to_darwin_dropped;
+static void bridge_to_darwin(uint8_t type, const uint8_t *a, unsigned na, const uint8_t *p, unsigned n);
 
 static inline uint16_t le16(const uint8_t *p) { return p[0] | p[1] << 8; }
 static inline uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -220,6 +246,40 @@ static void acl_received(uint16_t handle, const uint8_t *p, unsigned n);
 static void
 event(uint8_t code, const uint8_t *p, unsigned n)
 {
+	if (b.step == 3 && uart_connected && b.waiting_op == 0) {
+		uint8_t e[2] = { code, (uint8_t)n }, q[255];
+
+		memcpy(q, p, n);
+		if (code == EV_CMD_COMPLETE && n >= 4 && q[3] != 0) {
+			static unsigned told;
+
+			if (told++ < 32) {
+				printf("w2bt: bridge: command %#x failed in the controller (status %#x)\n", le16(q + 1), q[3]);
+			}
+		}
+		if (code == EV_CMD_COMPLETE && n >= 3) {
+			q[0] = 1;                               /* one command at a time */
+			if (le16(q + 1) == 0x1001 && n >= 12 && q[3] == 0) {
+				put16(q + 8, 15);               /* Broadcom */
+				put16(q + 10, 0x420e);          /* the BCM4357B1's LMP subversion */
+			}
+			if (le16(q + 1) == 0x1002 && n >= 4 + 64 && q[3] == 0) {
+				/*
+				 * the commands answered here are supported, as far as bluetoothd is told: it does not send one the
+				 * controller says it has not got, and takes that for a failure (Core 5.3 Vol 4 Part E 6.27)
+				 */
+				q[4 + 10] |= 0xe0;              /* controller-to-host flow control, host buffer size, host completed */
+				q[4 + 18] |= 0x0c;              /* read / write default erroneous data reporting */
+				q[4 + 22] |= 0x04;              /* set event mask page 2 */
+				q[4 + 44] |= 0x01;              /* LE set host feature */
+				q[4 + 46] |= 0x01;              /* LE set default subrate */
+			}
+		} else if (code == EV_CMD_STATUS && n >= 4) {
+			q[1] = 1;
+		}
+		bridge_to_darwin(0x04, e, 2, q, n);
+		return;
+	}
 	switch (code) {
 	case EV_CMD_COMPLETE:
 		if (n >= 3 && le16(p + 1) == b.waiting_op) {
@@ -316,7 +376,13 @@ poll_controller(void)
 			if (lacl[o] != 0x02 || len >= 0x405 || o + 8 + len > n) {
 				break;
 			}
-			acl_received(le16(lacl + o + 4), lacl + o + 8, len);
+			if (b.step == 3) {
+				if (uart_connected) {
+					bridge_to_darwin(0x02, lacl + o + 4, 4, lacl + o + 8, len);
+				}
+			} else {
+				acl_received(le16(lacl + o + 4), lacl + o + 8, len);
+			}
 			o += (len + 11) & ~3u;
 		}
 		b.acl_r = acl_w;
@@ -420,6 +486,269 @@ acl_send(uint16_t cid, const uint8_t *payload, unsigned n)
 	put32(entry + 12, 0);
 	return hakios_w2bt_sram_write(TX_BUF + slot * TX_BUF_STRIDE, pkt, (8 + n + 3) & ~3u) &&
 	       hakios_w2bt_sram_write(TX_TABLE + 16 * slot, entry, sizeof(entry));
+}
+
+/* ---- the bridge to Darwin's Bluetooth ---- */
+
+/* an HCI command as Darwin sends it (opcode, length, parameters), into the controller's ring */
+static void
+raw_command(const uint8_t *c, unsigned len)
+{
+	uint8_t buf[260];
+	unsigned l4 = (len + 3) & ~3u;
+	uint32_t r = 0, used;
+
+	if (len > 258) {
+		return;
+	}
+	memcpy(buf, c, len);
+	bzero(buf + len, l4 - len);
+	lck_mtx_lock(&bt_lock);
+	for (int tries = 0; tries < 100; tries++) {
+		hakios_w2bt_read(CMD_RD, &r);
+		used = (b.cmd_w - (r & 0xfff) + CMD_RING_SIZE) % CMD_RING_SIZE;
+		if (CMD_RING_SIZE - used - 4 >= l4) {
+			break;
+		}
+		IOSleep(2);
+	}
+	if (b.cmd_w + l4 <= CMD_RING_SIZE) {
+		hakios_w2bt_sram_write(CMD_RING + b.cmd_w, buf, l4);
+	} else {
+		unsigned first = CMD_RING_SIZE - b.cmd_w;
+
+		hakios_w2bt_sram_write(CMD_RING + b.cmd_w, buf, first);
+		hakios_w2bt_sram_write(CMD_RING, buf + first, l4 - first);
+	}
+	b.cmd_w = (b.cmd_w + l4) % CMD_RING_SIZE;
+	hakios_w2bt_write(CMD_WR, b.cmd_w);
+	lck_mtx_unlock(&bt_lock);
+}
+
+/* an ACL packet as Darwin sends it (handle and flags, length, data), into one of the controller's eight places */
+static void
+raw_acl(const uint8_t *pkt, unsigned len)
+{
+	uint8_t table[0x80], entry[16], buf[TX_BUF_STRIDE];
+	unsigned slot = 8, prio = 0, handle = le16(pkt) & 0x0fff;
+
+	if (len > TX_BUF_STRIDE || len < 4) {
+		return;
+	}
+	lck_mtx_lock(&bt_lock);
+	for (int tries = 0; tries < 200 && slot == 8; tries++) {
+		if (!hakios_w2bt_sram_read(TX_TABLE, table, sizeof(table))) {
+			break;
+		}
+		for (unsigned i = 0; i < 8; i++) {
+			if (le32(table + 16 * i + 8) == 2) {
+				put32(table + 16 * i + 8, 0);   /* done: free again */
+				hakios_w2bt_sram_write(TX_TABLE + 16 * i, (const uint8_t []){ 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
+					0, 0, 0, 0 }, 16);
+			}
+		}
+		for (unsigned i = 0; i < 8; i++) {
+			if (le32(table + 16 * i + 8) == 1 && le32(table + 16 * i + 4) == handle && le32(table + 16 * i) + 1 > prio) {
+				prio = le32(table + 16 * i) + 1;
+			}
+		}
+		for (slot = 0; slot < 8 && le32(table + 16 * slot + 8) != 0; slot++) {
+		}
+		if (slot == 8) {
+			IOSleep(2);
+		}
+	}
+	if (slot < 8) {
+		memcpy(buf, pkt, len);
+		bzero(buf + len, ((len + 3) & ~3u) - len);
+		put32(entry, prio);
+		put32(entry + 4, handle);
+		put32(entry + 8, 1);
+		put32(entry + 12, 0);
+		hakios_w2bt_sram_write(TX_BUF + slot * TX_BUF_STRIDE, buf, (len + 3) & ~3u);
+		hakios_w2bt_sram_write(TX_TABLE + 16 * slot, entry, sizeof(entry));
+	} else {
+		printf("w2bt: bridge: no room for Darwin's ACL data: dropped\n");
+	}
+	lck_mtx_unlock(&bt_lock);
+}
+
+/* an H4 packet for Darwin: its type, a header, the rest */
+static void
+bridge_to_darwin(uint8_t type, const uint8_t *a, unsigned na, const uint8_t *p, unsigned n)
+{
+	uint8_t pkt[1 + 4 + 0x408];
+
+	if (!uart_connected || 1 + na + n > sizeof(pkt)) {
+		return;
+	}
+	pkt[0] = type;
+	memcpy(pkt + 1, a, na);
+	memcpy(pkt + 1 + na, p, n);
+	if (ctl_enqueuedata(uart_ref, uart_unit, pkt, 1 + na + n, 0) != 0 && to_darwin_dropped++ < 10) {
+		printf("w2bt: bridge: Darwin is not reading: a packet dropped\n");
+	}
+}
+
+/* one whole H4 packet from Darwin */
+static void
+from_darwin(const uint8_t *p, unsigned n)
+{
+	if (p[0] == 0x01) {
+		uint16_t op = le16(p + 1);
+
+		if (op == 0x0c35) {
+			return;                                 /* host number of completed packets: no flow control here */
+		}
+		if ((op >> 10) == 0x3f || op == 0x0c63 || op == 0x0c31 || op == 0x0c33 || op == 0x0c5b || op == 0x2074 ||
+		    op == 0x207d) {
+			/*
+			 * Broadcom's: done, as far as Darwin is told. So are the few of bluetoothd's start that the W2 does not
+			 * have and that change nothing it needs: event mask page 2, the host's own flow control and buffer size,
+			 * erroneous data reporting, LE host features, LE default subrate.
+			 */
+			/*
+			 * Command Complete: one command at a time, the opcode, status 0. Broadcom's carry return parameters that
+			 * bluetoothd reads (its LE meta commands: the sub-command again, then their own): those are its parameters
+			 * echoed, then zeros, sixteen bytes in all -- as plausible as anything without the chip.
+			 */
+			uint8_t e[2] = { EV_CMD_COMPLETE, 4 }, q[4 + 16];
+			unsigned extra = 0;
+
+			q[0] = 1;
+			q[1] = p[1];
+			q[2] = p[2];
+			q[3] = 0;
+			if ((op >> 10) == 0x3f) {
+				extra = 16;
+				bzero(q + 4, extra);
+				memcpy(q + 4, p + 4, p[3] < extra ? p[3] : extra);
+			}
+			e[1] = (uint8_t)(4 + extra);
+			if (vendor_answered++ < 64) {
+				printf("w2bt: bridge: command %#x (%u bytes) answered here\n", op, p[3]);
+			}
+			bridge_to_darwin(0x04, e, 2, q, 4 + extra);
+			return;
+		}
+		raw_command(p + 1, n - 1);
+	} else if (p[0] == 0x02) {
+		raw_acl(p + 1, n - 1);
+	}
+}
+
+static errno_t
+uart_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
+{
+	(void)ref;
+	*unitinfo = NULL;
+	uart_unit = sac->sc_unit;
+	h4_length = 0;
+	uart_connected = true;
+	printf("w2bt: bridge: Darwin opens the UART (unit %u)\n", sac->sc_unit);
+	return 0;
+}
+
+static errno_t
+uart_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
+{
+	(void)ref, (void)unitinfo;
+	if (unit == uart_unit) {
+		uart_connected = false;
+		printf("w2bt: bridge: Darwin closes the UART\n");
+	}
+	return 0;
+}
+
+static errno_t
+uart_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags)
+{
+	(void)ref, (void)unitinfo, (void)flags;
+	for (mbuf_t q = m; q != NULL; q = mbuf_next(q)) {
+		size_t len = mbuf_len(q);
+		const uint8_t *d = mbuf_data(q);
+
+		if (h4_length + len > sizeof(h4)) {
+			h4_length = 0;                          /* (out of step: start again) */
+		}
+		memcpy(h4 + h4_length, d, len);
+		h4_length += (unsigned)len;
+	}
+	mbuf_freem(m);
+	/* every whole packet: command (1, opcode, length) or ACL (2, handle, u16 length) */
+	for (;;) {
+		unsigned need;
+
+		if (h4_length == 0) {
+			break;
+		}
+		if (h4[0] == 0x01) {
+			need = h4_length >= 4 ? 4 + h4[3] : 0;
+		} else if (h4[0] == 0x02) {
+			need = h4_length >= 5 ? 5 + le16(h4 + 3) : 0;
+		} else {
+			printf("w2bt: bridge: Darwin writes packet type %u: out of step\n", h4[0]);
+			h4_length = 0;
+			break;
+		}
+		if (need == 0 || h4_length < need) {
+			break;
+		}
+		if (unit == uart_unit) {
+			from_darwin(h4, need);
+		}
+		memmove(h4, h4 + need, h4_length - need);
+		h4_length -= need;
+	}
+	return 0;
+}
+
+/* the line settings: TIOCGETA / TIOCSETA as socket options, kept and given back */
+#define OPT_TIOCGETA    ((int)0x40487413)
+#define OPT_TIOCSETA    ((int)0x80487414)
+
+static errno_t
+uart_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len)
+{
+	(void)ref, (void)unit, (void)unitinfo;
+	if (opt == OPT_TIOCSETA && data != NULL) {
+		memcpy(termios, data, len < sizeof(termios) ? len : sizeof(termios));
+	}
+	return 0;
+}
+
+static errno_t
+uart_getopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len)
+{
+	(void)ref, (void)unit, (void)unitinfo;
+	if (opt == OPT_TIOCGETA && data != NULL && len != NULL) {
+		*len = *len < sizeof(termios) ? *len : sizeof(termios);
+		memcpy(data, termios, *len);
+		return 0;
+	}
+	return EOPNOTSUPP;
+}
+
+static void
+uart_register(void)
+{
+	struct kern_ctl_reg reg;
+	errno_t error;
+
+	bzero(&reg, sizeof(reg));
+	strlcpy(reg.ctl_name, "com.apple.uart.bluetooth", sizeof(reg.ctl_name));
+	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	reg.ctl_sendsize = 64 * 1024;
+	reg.ctl_recvsize = 64 * 1024;
+	reg.ctl_connect = uart_connect;
+	reg.ctl_disconnect = uart_disconnect;
+	reg.ctl_send = uart_send;
+	reg.ctl_setopt = uart_setopt;
+	reg.ctl_getopt = uart_getopt;
+	error = ctl_register(&reg, &uart_ref);
+	if (error != 0) {
+		printf("w2bt: bridge: the kernel control cannot be made (%d)\n", error);
+	}
 }
 
 /* ---- the remote ---- */
@@ -975,6 +1304,19 @@ bt_thread(__unused void *arg, __unused wait_result_t wr_)
 	if (cmd(0x1001, NULL, 0, a, 9) == 0) {
 		printf("w2bt: HCI version %u (revision %#x), LMP %u, manufacturer %#x\n", a[1], le16(a + 2), a[4], le16(a + 5));
 	}
+	if (b.step == 3) {
+		uint8_t shown[6];
+
+		for (int i = 0; i < 6; i++) {
+			shown[i] = b.own[5 - i];
+		}
+		HakiosBluetoothStart(shown);
+		printf("w2bt: the controller is Darwin's now (through com.apple.uart.bluetooth)\n");
+		for (;;) {
+			poll_controller();
+			IOSleep(uart_connected && b.active ? 1 : 4);
+		}
+	}
 	cmd(0x0c01, mask, 8, NULL, 0);
 	cmd(0x2001, lemask, 8, NULL, 0);
 	if (b.stop_at >= 4) {
@@ -1078,6 +1420,9 @@ hakios_w2bt_start(void)
 		return;
 	}
 	PE_parse_boot_argn("w2bt_stop", &b.stop_at, sizeof(b.stop_at));
+	if (b.step == 3) {
+		uart_register();
+	}
 	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_set_thread_name(thread, "w2 bt");
 		thread_deallocate(thread);

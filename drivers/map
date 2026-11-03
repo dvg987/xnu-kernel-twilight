@@ -74,3 +74,4 @@ wifi     bsd/dev/hakios.xhci.c
 wifi     bsd/dev/hakios.w2.c
 wifi     bsd/dev/hakios.w2wpa.c
 wifi     bsd/dev/hakios.w2bt.c
+bluetooth iokit/Kernel/hakios.btsvc.cpp
