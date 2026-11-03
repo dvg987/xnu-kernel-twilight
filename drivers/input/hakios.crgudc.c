@@ -3,7 +3,8 @@
  * at 0xfe350000): one vendor interface with one bulk OUT endpoint, over which the host sends keys.
  * Boot-arg usbkeys=1. A record is 8 bytes, { type, code } as in sys/hakios.input.h: type 4 (down) or 5 (up),
  * code (HID usage page << 16) | usage; each goes to /dev/hakios-touch, where backboardd's twilight keys take
- * it (tvos/src/twlinput.inc). The host side is tools/twl-keys.py.
+ * it (tvos/src/twlinput.inc). The host side is tools/twl-keys.py. Type 9 with code 'STOP' (0x504f5453) ends the
+ * run: control goes back to the loader, as when loader_return_after expires (and from there to fastboot).
  *
  * Polled from a kernel thread, no interrupt. The controller is used as U-Boot's fastboot leaves it (clock and
  * PHY up); it is stopped, reset and set up again here. Rings, contexts and buffers are one physically
@@ -25,6 +26,10 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
+extern void loader_return(void);
+
+#define RECORD_STOP     9
+#define STOP_CODE       0x504f5453      /* "STOP" */
 
 #define CRG_BASE        0xfe350000UL
 #define R_ROLE          0x20fc
@@ -325,6 +330,10 @@ handle_out(const volatile uint32_t *e)
 		uint32_t type = b[i] | b[i + 1] << 8 | b[i + 2] << 16 | (uint32_t)b[i + 3] << 24;
 		uint32_t code = b[i + 4] | b[i + 5] << 8 | b[i + 6] << 16 | (uint32_t)b[i + 7] << 24;
 
+		if (type == RECORD_STOP && code == STOP_CODE) {
+			printf("\n--- usbkeys: the host says stop: back to the loader ---\n");
+			loader_return();
+		}
 		if (type == HAKIOS_BUTTON_DOWN || type == HAKIOS_BUTTON_UP) {
 			hakios_touch_post(type, code, 0, 0);
 			if (u.keys++ < 32) {

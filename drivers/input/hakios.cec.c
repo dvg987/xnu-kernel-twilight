@@ -2,7 +2,7 @@
  * HDMI-CEC on the Amlogic box (S905X5M "S7D": the CEC-B controller at 0xfe044000): the TV's own remote as
  * the box's remote. Boot-arg cec=1. The box claims logical address 4 (playback device 1), answers what a TV
  * asks a playback device, and turns <User Control Pressed>/<Released> into key records of /dev/hakios-touch
- * (HID consumer page: Menu Pick/Up/Down/Left/Right, Menu, Play/Pause), the same queue as the USB keys
+ * (HID consumer page: Menu Pick/Up/Down/Left/Right, Home, Play/Pause; Back as a keyboard's Escape), the same queue as the USB keys
  * (hakios.crgudc.c) and backboardd's twilight keys take them (tvos/src/twlinput.inc).
  *
  * Polled from a kernel thread, no interrupt. The programming model is Amlogic's Linux driver
@@ -227,31 +227,33 @@ announce(void)
 	send(0, menu_on, sizeof(menu_on));
 }
 
-/* <User Control Pressed> operand -> HID consumer usage (page 0x0c) */
+/*
+ * <User Control Pressed> operand -> key record code, (HID usage page << 16) | usage. tvOS's "back" is a
+ * keyboard's Escape; the consumer page's Menu is taken for Home.
+ */
 static uint32_t
 key_of(uint8_t ui)
 {
 	switch (ui) {
-	case 0x00: return 0x41;         /* Select -> Menu Pick */
-	case 0x01: return 0x42;         /* Up */
-	case 0x02: return 0x43;         /* Down */
-	case 0x03: return 0x44;         /* Left */
-	case 0x04: return 0x45;         /* Right */
+	case 0x00: return 0x0c0041;     /* Select -> Menu Pick */
+	case 0x01: return 0x0c0042;     /* Up */
+	case 0x02: return 0x0c0043;     /* Down */
+	case 0x03: return 0x0c0044;     /* Left */
+	case 0x04: return 0x0c0045;     /* Right */
+	case 0x0d: return 0x070029;     /* Exit (the remote's Back) -> Escape */
 	case 0x09:                      /* Root Menu */
 	case 0x0a:                      /* Setup Menu */
-	case 0x0b:                      /* Contents Menu */
-	case 0x0d: return 0x40;         /* Exit -> Menu (back) */
+	case 0x0b: return 0x0c0223;     /* Contents Menu -> AC Home */
 	case 0x44:                      /* Play */
 	case 0x46:                      /* Pause */
-	case 0x61: return 0xcd;         /* Pause-Play -> Play/Pause */
+	case 0x61: return 0x0c00cd;     /* Pause-Play -> Play/Pause */
 	default: return 0;
 	}
 }
 
 static void
-key(uint32_t usage, bool down)
+key(uint32_t code, bool down)
 {
-	uint32_t code = 0x0c << 16 | usage;
 
 	if (down) {
 		if (c.held != 0 && c.held != code) {
@@ -287,10 +289,10 @@ handle(const uint8_t *m, int n)
 	switch (op) {
 	case 0x44:              /* User Control Pressed */
 		if (n > 2) {
-			uint32_t usage = key_of(m[2]);
+			uint32_t code = key_of(m[2]);
 
-			if (usage != 0) {
-				key(usage, true);
+			if (code != 0) {
+				key(code, true);
 			} else {
 				printf("cec: key %#x not mapped\n", m[2]);
 			}
