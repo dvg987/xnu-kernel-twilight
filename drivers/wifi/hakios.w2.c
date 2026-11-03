@@ -130,6 +130,7 @@ static struct {
 	int last_error;
 	struct lx_wpa wpa;
 	volatile int handshake;
+	bool group_pending;                 /* a new group key from the handshake, for the worker to install */
 	unsigned eapol;
 	uint8_t rsn[22];
 } w;
@@ -261,7 +262,13 @@ handshake_message(const uint8_t *frame, unsigned length)
 	}
 	printf("w2: the handshake: a message of %u bytes: %s%s\n", length - 14, said == LX_WPA_ANSWER ? "the first; answered" :
 	    said == LX_WPA_KEYS ? "the third, signed with our key too; answered" : said == LX_WPA_GROUP ?
-	    "a new group key (not installed yet: not done here)" : said == LX_WPA_BAD ? "NOT GOOD: " : "not one to answer", why);
+	    "a new group key; answered" : said == LX_WPA_BAD ? "NOT GOOD: " : "not one to answer", why);
+	if (said == LX_WPA_GROUP && w.joined) {
+		lck_mtx_lock(&w2_lock);
+		w.group_pending = true;
+		thread_wakeup((event_t)&w.group_pending);
+		lck_mtx_unlock(&w2_lock);
+	}
 	if (said != LX_WPA_NOTHING) {
 		lck_mtx_lock(&w2_lock);
 		if (w.handshake != LX_WPA_KEYS) {
@@ -1197,6 +1204,25 @@ sta_channels(struct hakios_sta_channel *channels, unsigned most)
 	return n;
 }
 
+/* what waits for the firmware's answers and so cannot be done on the poll thread: a new group key */
+static void
+worker_thread(__unused void *arg, __unused wait_result_t wr_)
+{
+	for (;;) {
+		lck_mtx_lock(&w2_lock);
+		while (!w.group_pending) {
+			sleep_ms(&w.group_pending, 60000);
+		}
+		w.group_pending = false;
+		lck_mtx_unlock(&w2_lock);
+		if (w.joined) {
+			int error = key_add(w.wpa.group_index, 0xff, w.wpa.group, w.wpa.group_length, false);
+
+			printf("w2: the new group key (number %u): %s\n", w.wpa.group_index, error ? "REFUSED" : "installed");
+		}
+	}
+}
+
 static struct hakios_sta_ops sta_ops = {
 	.power = sta_power,
 	.scan = sta_scan,
@@ -1289,6 +1315,10 @@ hakios_w2_run(unsigned step)
 	hakios_w2_write(IPC_UNMASK, 0x00004fbf);
 	if (kernel_thread_start(start_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_set_thread_name(thread, "w2 start");
+		thread_deallocate(thread);
+	}
+	if (kernel_thread_start(worker_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "w2 work");
 		thread_deallocate(thread);
 	}
 	for (;;) {
