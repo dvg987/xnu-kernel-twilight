@@ -21,3 +21,6 @@ driver UFS
 driver VIRTIO_BLK
 	file    bsd/dev/hakios.virtio_blk.c
 	help    a disk image of the host as /dev/rvblk0 (virtio_blk=1). QEMU only
+
+standard bsd/dev/hakios.emmc.c
+	help    the Amlogic box's eMMC as /dev/emmc_darwin (emmc=1 read only, emmc=2 writable): the SD_EMMC controller as U-Boot left it

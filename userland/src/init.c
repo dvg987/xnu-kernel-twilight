@@ -172,6 +172,15 @@ mount_cryptex(const char *name, const char *container, const char *flashdev)
 	check(1, what);
 }
 
+/* the same, where the volume has that directory at all (an Apple TV has no NanoLaunchDaemons) */
+static int
+bind_dir_if_there(const char *from, const char *to)
+{
+	struct stat st;
+
+	return stat(to, &st) != 0 || bind_dir(from, to);
+}
+
 static void
 flash_root(const char *dev)
 {
@@ -194,8 +203,9 @@ flash_root(const char *dev)
 	}
 	check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
 	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
+	    bind_dir_if_there(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
+	    bind_dir_if_there(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
+	    bind_dir_if_there(in_image("/empty"), "/flash/System/Library/DeveloperModeLaunchDaemons") &&
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not Darwin's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");

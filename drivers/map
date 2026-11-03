@@ -67,3 +67,4 @@ power   bsd/dev/hakios.thermal.c
 power   bsd/dev/hakios.pmic.c
 power   bsd/dev/hakios.battguard.c
 bluetooth bsd/dev/hakios.bt.c
+storage  bsd/dev/hakios.emmc.c

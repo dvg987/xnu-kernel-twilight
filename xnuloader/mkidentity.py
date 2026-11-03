@@ -97,9 +97,12 @@ def main():
                                     'platform-name', 'time-stamp', 'secure-root-prefix'))
     emit('identity_product', children['product'][0], ('name', 'AAPL,phandle'))
     product = {name_of(c): c for c in children['product'][1]}
-    emit('identity_haptics', product['haptics'][0], ('name', 'AAPL,phandle'))
-    # (the camera's: the loader takes from it what the hardware here has, the flash so far)
-    emit('identity_camera', product['camera'][0], ('name', 'AAPL,phandle'))
+    # an Apple TV has neither haptics nor a camera under /product
+    for label, node in (('identity_haptics', 'haptics'), ('identity_camera', 'camera')):
+        if node in product:
+            emit(label, product[node][0], ('name', 'AAPL,phandle'))
+        else:
+            emit_empty(label)
 
 
 if __name__ == '__main__':
