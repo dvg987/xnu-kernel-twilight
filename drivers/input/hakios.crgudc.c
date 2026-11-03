@@ -26,7 +26,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
-extern void loader_return(void);
+extern void loader_return_now(void);
 
 #define RECORD_STOP     9
 #define STOP_CODE       0x504f5453      /* "STOP" */
@@ -332,7 +332,7 @@ handle_out(const volatile uint32_t *e)
 
 		if (type == RECORD_STOP && code == STOP_CODE) {
 			printf("\n--- usbkeys: the host says stop: back to the loader ---\n");
-			loader_return();
+			loader_return_now();
 		}
 		if (type == HAKIOS_BUTTON_DOWN || type == HAKIOS_BUTTON_UP) {
 			hakios_touch_post(type, code, 0, 0);
