@@ -17,7 +17,7 @@
 //   firmware fw/mali_csffw.bin of the small image (CoreELEC's arm/mali/arch10.8/mali_csffw.bin, the v10 image), not built in
 //
 // Boot-args: mali=1  power, clocks, GPU_ID, L2 (M0);  mali=2  and the firmware and MCU (M1);  3.. as in the original
-//            mali-clk=S  the clock source (3..7 above; default 6: 400 MHz, what Amlogic's Linux runs at)
+//            mali-clk=S  the clock source (3..7 above; default 3: 800 MHz; 6 is the 400 MHz Amlogic's Linux runs at)
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
@@ -92,9 +92,9 @@ const char *clockName(uint32_t sel) {
 // The GPU's clock and its shader stacks' from one of the fixed PLL's dividers (mali_0, bit 31 clear), ungated; the bus clock ungated; both
 // resets released. The vendor's Linux sets the rate first and then enables (its glue says the other order may not be ready).
 bool setClocks() {
-  unsigned source = 6;
+  unsigned source = 3;   // 800 MHz: the frame the window server draws takes half the time it does at 400 (Amlogic's Linux default)
   PE_parse_boot_argn("mali-clk", &source, sizeof source);
-  if (source < 3 || source > 7) source = 6;
+  if (source < 3 || source > 7) source = 3;
   printf("mali: clocks before: mali %#x stack %#x sys_en0 %#x; reset level %#x\n", gClk[kClkMali / 4], gClk[kClkMaliStack / 4], gClk[kClkSysEn0 / 4],
          gReset[kResetLevel1 / 4]);
   const uint32_t value = (source << 9) | (1u << 8);   // div 0: the source's own rate
