@@ -2065,9 +2065,39 @@ void gpuStallScan() {
     printf("mali: STALL group %u in slot %u (AS%u) for %llu s: csg req %#x ack %#x state %#x endpoint %#x/%#x\n", g->id, slot, g->ctx ? g->ctx->as : 0u,
            static_cast<unsigned long long>((now - since[idx]) / gCallStatFreq), s.in->req, s.out->ack, s.out->statusState, s.out->statusEndpointCurrent, s.out->statusEndpointReq);
     ++shown;
+    {
+      // the firmware writes the streams' status (command pointer, what they wait for) only when asked: Panthor's CSG_REQ_STATUS_UPDATE
+      const uint32_t bit = 1u << 3;
+      s.in->req = (s.in->req & ~bit) | ((~s.out->ack) & bit);
+      ringGlobalDoorbell(slot);
+      const bool updated = waitUs(20000, [&s, bit] { return (s.out->ack & bit) == (s.in->req & bit); });
+      printf("mali: STALL   status update %s (csg req %#x ack %#x)\n", updated ? "answered" : "NOT answered", s.in->req, s.out->ack);
+    }
     for (unsigned q = 0; q < g->queues; ++q) {
       CsView c;
       if (!csView(s, q, c)) continue;
+      printf("mali: STALL   queue %u waits on %#llx for %#x%08x (scoreboards %#x, resource %#x)\n", q,
+             static_cast<unsigned long long>(c.out->statusWaitSyncPtr), c.out->statusWaitSyncValueHi, c.out->statusWaitSyncValue,
+             c.out->statusScoreboards, c.out->statusReqResource);
+      {
+        const volatile uint32_t *o = reinterpret_cast<const volatile uint32_t *>(c.out);
+        const volatile uint32_t *i = reinterpret_cast<const volatile uint32_t *>(c.in);
+        printf("mali: STALL   queue %u heap: in start %#x%08x end %#x%08x, out vt %#x..%#x frag end %#x address %#x%08x; fault info %#x%08x fatal info %#x%08x\n", q,
+               i[0x24 / 4], i[0x20 / 4], i[0x2c / 4], i[0x28 / 4], o[0xc0 / 4], o[0xc4 / 4], o[0xcc / 4], o[0xd4 / 4], o[0xd0 / 4],
+               o[0x8c / 4], o[0x88 / 4], o[0x94 / 4], o[0x90 / 4]);
+        const Queue &qu = g->q[q];
+        const volatile RingOutput *rout = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
+        if (qu.ring.kva && qu.ringSize) {
+          const uint64_t at = (rout->extract & ~7ull) % qu.ringSize;
+          const volatile uint64_t *w = reinterpret_cast<const volatile uint64_t *>(qu.ring.kva);
+          printf("mali: STALL   queue %u ring at %#llx: %016llx %016llx %016llx %016llx | %016llx %016llx %016llx %016llx\n", q,
+                 static_cast<unsigned long long>(at), static_cast<unsigned long long>(w[((at - 32) % qu.ringSize) / 8]),
+                 static_cast<unsigned long long>(w[((at - 24) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at - 16) % qu.ringSize) / 8]),
+                 static_cast<unsigned long long>(w[((at - 8) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[at / 8]),
+                 static_cast<unsigned long long>(w[((at + 8) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at + 16) % qu.ringSize) / 8]),
+                 static_cast<unsigned long long>(w[((at + 24) % qu.ringSize) / 8]));
+        }
+      }
       const volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[slot].iface[q].kva);
       const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
       printf("mali: STALL   queue %u: jobs %llu of %llu, ring extract %#llx insert %#llx active %u, cs req %#x ack %#x, cmd %#llx blocked %u wait %#x, fault %#x fatal %#x\n", q,
@@ -2075,6 +2105,9 @@ void gpuStallScan() {
              static_cast<unsigned long long>(ro->extract), static_cast<unsigned long long>(ri->insert), ro->active, c.in->req, c.out->ack,
              static_cast<unsigned long long>(c.out->statusCmdPtr), c.out->statusBlockedReason, c.out->statusWait, c.out->fault, c.out->fatal);
     }
+    printf("mali: STALL   global: req %#x ack %#x doorbell req %#x ack %#x halt %#x; csg doorbell req %#x ack %#x irq req %#x ack %#x; GPU fault %#x at %#x%08x, AS0 fault %#x\n",
+           gGlbInput->req, gGlbOutput->ack, gGlbInput->doorbellReq, gGlbOutput->doorbellAck, gGlbOutput->haltStatus, s.in->doorbellReq, s.out->doorbellAck,
+           s.out->csIrqReq, s.in->csIrqAck, gpu(kGpuFaultStatus), gpu(kGpuFaultAddr + 4), gpu(kGpuFaultAddr), gpu(asReg(0, kAsFaultStatus)));
     printf("mali: STALL   mmu AS%u: fault status %#x, status %#x; job irq raw %#x, mcu %u\n", g->ctx ? g->ctx->as : 0u, g->ctx ? gpu(asReg(g->ctx->as, kAsFaultStatus)) : 0u,
            g->ctx ? gpu(asReg(g->ctx->as, kAsStatus)) : 0u, gpu(kJobIntRaw), gpu(kMcuStatus));
   }
@@ -2214,9 +2247,10 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       if (!bo) return kIOReturnNoMemory;
       bos[h] = bo;
       boCreated++;
-      if (bo->size >= (4ull << 20)) {   // what a client's memory is made of: the big ones, by process and handle (the first few dozen)
-        static unsigned big;
-        if (big++ < 160) printf("mali: %s makes buffer %u of %llu KiB (%llu MiB alive now)\n", ownerName, h + 1, (unsigned long long)(bo->size >> 10), (unsigned long long)(boLiveBytes >> 20));
+      if (bo->size >= (1ull << 20)) {   // what a client's memory is made of: the big ones, by process and handle (boot-arg mali-bigs: how many)
+        static unsigned big, bigs = 99999;
+        if (bigs == 99999) { bigs = 160; PE_parse_boot_argn("mali-bigs", &bigs, sizeof bigs); }
+        if (big++ < bigs) printf("mali: %s makes buffer %u of %llu KiB (%llu MiB alive now)\n", ownerName, h + 1, (unsigned long long)(bo->size >> 10), (unsigned long long)(boLiveBytes >> 20));
       }
       boLiveBytes += bo->size;
       if (boLiveBytes > boPeakBytes) boPeakBytes = boLiveBytes;
@@ -2289,7 +2323,13 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       Ctx *c = vmFor(i.vm);
       if (!c) return kIOReturnBadArgument;
       mali_heap_create_out o = {};
-      const int slot = heapCreate(*c, i.initial_chunk_count, i.chunk_size, i.max_chunks, this, &o.ctx_va, &o.first_chunk_va);
+      // No chunk is ever added to a heap (no out-of-memory handling yet), so it starts with enough for the window server's longest command
+      // buffers: boot-arg mali-heap-chunks=N (default 24) at the least, within the client's maximum.
+      static unsigned least = 0;
+      if (!least) { least = 24; PE_parse_boot_argn("mali-heap-chunks", &least, sizeof least); }
+      uint32_t initial = i.initial_chunk_count;
+      if (initial < least) initial = least < i.max_chunks ? least : i.max_chunks;
+      const int slot = heapCreate(*c, initial, i.chunk_size, i.max_chunks, this, &o.ctx_va, &o.first_chunk_va);
       if (slot < 0) return kIOReturnNoMemory;
       o.handle = static_cast<uint32_t>(slot) + 1;
       PUT_OUT(mali_heap_create_out, o);
