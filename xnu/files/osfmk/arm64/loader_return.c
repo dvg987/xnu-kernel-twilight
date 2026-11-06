@@ -454,6 +454,17 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	loader_return_test((void *)(uintptr_t)(as_panic ? 2 : 1));
 }
 
+/*
+ * The same way out as when loader_return_after expires, now, from a thread (the USB keys' STOP): the devices are
+ * stopped while there is still a system to stop them in, before loader_return() turns everything off.
+ */
+void loader_return_now(void);
+void
+loader_return_now(void)
+{
+	loader_return_timer(NULL, NULL);
+}
+
 __startup_func
 static void
 loader_return_timer_init(void)

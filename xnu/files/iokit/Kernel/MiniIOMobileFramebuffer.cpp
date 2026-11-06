@@ -226,6 +226,14 @@ micros(uint64_t absolute)
  * does not come back with the phone's log), in a thread of its own; off by default.
  */
 static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
+static TUNABLE(uint32_t, gProbe, "fb_probe", 0);
+/*
+ * A panel of 24 bits a pixel (the Amlogic box: U-Boot leaves its display controller reading B, G, R from a frame of
+ * fb_stride bytes a row): the frames are put together in 32 bits as everywhere else, in memory of the driver's own,
+ * and each one is then packed into the panel's memory.
+ */
+static TUNABLE(uint32_t, gPanelBpp, "fb_bpp", 32);
+static TUNABLE(uint32_t, gPanelStride, "fb_stride", 0);
 #define DPU_INTF1_PAGE          0x0ae34000UL            /* the 16 KB page INTF_1 is in */
 #define DPU_INTF1_OFFSET        0x2000
 #define INTF_TIMING_ENGINE_EN   0x000
@@ -294,6 +302,9 @@ class IOMobileFramebuffer : public IOService
 public:
 	IOLock *        fLock;
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	uint8_t *       fPacked;                /* fb_bpp=24: the panel itself, fBase being the 32-bit frame of ours */
+	uint32_t        fPackedRowBytes;
+	void            packFrame(void);
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -369,6 +380,10 @@ public:
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool fSettling;                 /* drawing the last frame again, filtered (fb_filter=2) */
+	bool fScanning;                 /* fb_flip: the display is scanning a surface, not the panel's memory */
+	uint32_t fStatFlips, fStatFlipsKept, fStatFlipsLeft;
+	bool scanFrom(MiniIOSurface * s);
+	void scanPanel(void);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -492,6 +507,9 @@ IOMobileFramebuffer::publishModes(void)
 	OSSafeReleaseNULL(color);
 }
 
+static void gopInit(void * base, uint32_t width, uint32_t height, uint32_t rowBytes);   /* (below, with the GPU hand-off) */
+static IOMobileFramebuffer * gScanner;  /* fb_flip: whose display the GPU's finished frames go to */
+
 bool
 IOMobileFramebuffer::start(IOService * provider)
 {
@@ -530,6 +548,21 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	gopInit((void *) vinfo.v_baseaddr, fPanelWidth, fPanelHeight, fRowBytes);
+	gScanner = this;
+	if (gPanelBpp == 24) {
+		fPacked = fBase;
+		fPackedRowBytes = gPanelStride ? gPanelStride : fPanelWidth * 3;
+		fRowBytes = fPanelWidth * 4;
+		fBase = (uint8_t *) IOMallocData((size_t) fRowBytes * fPanelHeight);
+		if (fBase == NULL) {
+			IOLog("MiniIOMobileFramebuffer: no memory for a 32-bit frame\n");
+			return false;
+		}
+		bzero(fBase, (size_t) fRowBytes * fPanelHeight);
+		IOLog("MiniIOMobileFramebuffer: the panel takes 24 bits a pixel, %u bytes a row: frames are packed into it\n",
+		    fPackedRowBytes);
+	}
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -1027,6 +1060,26 @@ IOMobileFramebuffer::reportFrameTimes(void)
 }
 
 /* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has no other waiting. */
+/* The 32-bit frame into the 24-bit panel: four pixels into three words, B G R in memory. */
+void
+IOMobileFramebuffer::packFrame(void)
+{
+	for (uint32_t y = 0; y < fPanelHeight; y++) {
+		const uint32_t * from = (const uint32_t *) (fBase + (size_t) y * fRowBytes);
+		volatile uint32_t * to = (volatile uint32_t *) (fPacked + (size_t) y * fPackedRowBytes);
+		uint32_t x = 0;
+
+		for (; x + 4 <= fPanelWidth; x += 4, from += 4, to += 3) {
+			uint32_t a = from[0] & 0xffffff, b = from[1] & 0xffffff, c = from[2] & 0xffffff, d = from[3] & 0xffffff;
+
+			to[0] = a | b << 24;
+			to[1] = b >> 8 | c << 16;
+			to[2] = c >> 16 | d << 8;
+		}
+	}
+	__builtin_arm_dsb(0xf);
+}
+
 void
 IOMobileFramebuffer::present(const uint8_t * swap)
 {
@@ -1131,7 +1184,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	int32_t src[4], dst[4];
 
-	if (!fGraphics) {
+	if (!fGraphics || fScanning) {
 		return;
 	}
 	fSettling = true;
@@ -1149,6 +1202,374 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fStatSettled++;
 }
 
+/*
+ * The GPU's hand-off (on by default; boot-arg fb_gpu=0: never): a frame of one full-screen layer is not drawn into the panel by the processor
+ * (8 MB through write-combined memory a frame) but offered to the Mali's Metal plug-in in the window server, which waits
+ * for frames (MALI_GOP of drivers/gpu/hakios.mali.cpp, which calls native_gop_handoff_call below), has the GPU copy the
+ * surface's pages into the panel (native_gop_handoff_memory, mapped into it once) and completes the frame. The protocol is
+ * Ken-u's MaliMetal's (GopFramebuffer's NativeGOPPresenter on UniXNU): 0 the mode, 2 wait for a frame (its pages mapped into
+ * the caller), 3 the frame done. A frame nobody takes in time, or with no presenter waiting, is drawn as before.
+ */
+static TUNABLE(uint32_t, gGpuHandoff, "fb_gpu", 1);
+#define GOP_TAKE_MS     100             /* how long a frame waits for the presenter to finish it */
+#define GOP_IDLE_MS     500             /* a presenter that has not waited for this long is gone */
+
+struct gop_mode { uint32_t version, format; uint64_t width, height, stride, bytes; };
+struct gop_swap { uint64_t sequence, address, bytes, stride; uint32_t width, height, format, reserved; };
+
+static struct {
+	IOLock *                lock;
+	uint64_t                panelPhys, panelBytes, stride;
+	uint32_t                width, height;
+	uint64_t                lastWait;       /* mach_absolute_time of the presenter's last wait */
+	MiniIOSurface *         offered;        /* the frame being handed over, retained */
+	bool                    handed, done;
+	uint32_t                status;
+	uint64_t                sequence;
+	IOMemoryMap *           map;            /* its pages in the presenter's task */
+	uint64_t                frames, fallbacks;
+} gGop;
+
+extern "C" uint64_t kvtophys(vm_offset_t va);
+
+/*
+ * Boot-arg fb_flip=1: a frame of one full-screen layer is not copied at all. CoreAnimation hands a frame over before it commits
+ * the drawing, so the swap comes first: when the GPU has finished the surface, the window server's plug-in names it (op 4 below)
+ * and the Amlogic OSD1 is pointed at it there and then. A swap of such a frame does nothing more; any other frame is drawn into
+ * the panel's memory from the surface being scanned and the OSD goes back there.
+ */
+static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
+/* Boot-arg fb_flip_lag=N: a surface counts as on the display for N refreshes more than the next change of frame. */
+static TUNABLE(uint32_t, gFlipLag, "fb_flip_lag", 0);
+#define VPU_BASE                0xff000000UL    /* VCBUS: register number * 4 */
+#define VPU_BYTES               0x10000
+#define VIU_OSD1_BLK1_CFG_W4    0x1a14          /* the frame's address >> 4 */
+#define ENCP_INFO_READ          0x271d          /* [28:16] the line being sent */
+#define ENCP_VIDEO_MAX_LNCNT    0x1bae          /* the lines of a frame, less one */
+#define ENCP_DE_V_BEGIN         0x1c3c          /* the first line of the picture */
+#define ENCP_DE_V_END           0x1c3d          /* the line after its last */
+#define FLIP_WAIT_MS            51              /* two refreshes: past this a surface is drawn into anyway */
+
+static struct {
+	volatile uint32_t *     vpu;
+	MiniIOSurface *         next;           /* the surface of the swap to come, held */
+	MiniIOSurface *         current;        /* the surface being scanned, held */
+	uint32_t                leaving;        /* the surface scanned before it, on the panel until ... */
+	uint64_t                leftAt;         /* ... this time (mach_absolute_time): the OSD takes a new address between frames */
+	uint32_t                waits, waited;  /* of the window server for a surface to leave the display; microseconds */
+	uint32_t                blankMisses;    /* flips that did not find the blanking in time */
+} gScan;
+
+static void
+gopInit(void * base, uint32_t width, uint32_t height, uint32_t rowBytes)
+{
+	if (!gGpuHandoff || gGop.lock != NULL) {
+		return;
+	}
+	gGop.lock = IOLockAlloc();
+	gGop.panelPhys = kvtophys((vm_offset_t) base);
+	gGop.width = width;
+	gGop.height = height;
+	gGop.stride = rowBytes;
+	gGop.panelBytes = (uint64_t) rowBytes * height;
+	if (gFlip) {
+		gScan.vpu = (volatile uint32_t *) ml_io_map(VPU_BASE, VPU_BYTES);
+		IOLog("MiniIOMobileFramebuffer: fb_flip=1: OSD1 scans %#x0, line %u\n", gScan.vpu[VIU_OSD1_BLK1_CFG_W4],
+		    gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff);
+	}
+	IOLog("MiniIOMobileFramebuffer: fb_gpu=1: frames may go to the GPU's presenter (panel at %#llx, %ux%u, %u bytes a row)\n",
+	    (unsigned long long) gGop.panelPhys, width, height, rowBytes);
+}
+
+extern "C" IOMemoryDescriptor *
+native_gop_handoff_memory(void)
+{
+	if (gGop.lock == NULL || gGop.panelPhys == 0) {
+		return NULL;
+	}
+	return IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) gGop.panelPhys, (IOByteCount) round_page(gGop.panelBytes),
+	           kIODirectionInOut);
+}
+
+extern "C" IOReturn
+native_gop_handoff_call(uint32_t op, task_t task, const void * in, size_t inSize, void * out, size_t outSize)
+{
+	if (gGop.lock == NULL) {
+		return kIOReturnUnsupported;
+	}
+	switch (op) {
+	case 0: {
+		gop_mode mode = { 1, 1, gGop.width, gGop.height, gGop.stride, gGop.panelBytes };
+
+		if (out == NULL || outSize < sizeof(mode)) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(out, &mode, sizeof(mode));
+		return kIOReturnSuccess;
+	}
+	case 2: {
+		uint64_t timeoutMs = 100, deadline;
+		IOReturn result = kIOReturnTimeout;
+
+		if (in != NULL && inSize >= sizeof(timeoutMs)) {
+			memcpy(&timeoutMs, in, sizeof(timeoutMs));
+		}
+		if (out == NULL || outSize < sizeof(gop_swap)) {
+			return kIOReturnBadArgument;
+		}
+		clock_interval_to_deadline((uint32_t) (timeoutMs ? timeoutMs : 1), NSEC_PER_MSEC, &deadline);
+		IOLockLock(gGop.lock);
+		gGop.lastWait = mach_absolute_time();
+		while (gGop.offered == NULL || gGop.handed) {
+			if (IOLockSleepDeadline(gGop.lock, &gGop.offered, deadline, THREAD_INTERRUPTIBLE) != THREAD_AWAKENED) {
+				break;
+			}
+		}
+		if (gGop.offered != NULL && !gGop.handed) {
+			MiniIOSurface * f = gGop.offered;
+			uint64_t offset = (uint64_t) (f->kpixels - (uint8_t *) f->memory->getBytesNoCopy()) + f->info.offset;
+
+			gGop.map = f->memory->createMappingInTask(task, 0, kIOMapAnywhere, offset, f->info.allocSize);
+			if (gGop.map != NULL) {
+				gop_swap swap = { gGop.sequence, gGop.map->getAddress(), f->info.allocSize, f->info.bytesPerRow, f->info.width,
+					          f->info.height, 1, 0 };
+
+				memcpy(out, &swap, sizeof(swap));
+				gGop.handed = true;
+				result = kIOReturnSuccess;
+			} else {
+				gGop.done = true;               /* (drawn by the processor) */
+				gGop.status = 1;
+				IOLockWakeup(gGop.lock, &gGop.done, true);
+				result = kIOReturnNoMemory;
+			}
+		}
+		gGop.lastWait = mach_absolute_time();
+		IOLockUnlock(gGop.lock);
+		return result;
+	}
+	case 3: {
+		struct { uint64_t sequence; uint32_t status, reserved; } done;
+
+		if (in == NULL || inSize < sizeof(done)) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(&done, in, sizeof(done));
+		IOLockLock(gGop.lock);
+		if (gGop.handed && done.sequence == gGop.sequence) {
+			gGop.status = done.status;
+			gGop.done = true;
+			IOLockWakeup(gGop.lock, &gGop.done, true);
+		}
+		gGop.lastWait = mach_absolute_time();
+		IOLockUnlock(gGop.lock);
+		return kIOReturnSuccess;
+	}
+	case 4: {
+		uint32_t sid = 0;
+		MiniIOSurface * s, * old;
+
+		if (gScan.vpu == NULL) {
+			return kIOReturnUnsupported;
+		}
+		if (in == NULL || inSize < sizeof(sid)) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(&sid, in, sizeof(sid));
+		s = MiniIOSurfaceCopy(sid);
+		if (s == NULL) {
+			return kIOReturnNotFound;
+		}
+		if (s->info.width != gGop.width || s->info.height != gGop.height || s->info.bytesPerRow != gGop.stride ||
+		    MiniIOSurfaceScanAddress(s) == 0) {
+			static uint32_t refused;
+
+			if (refused++ % 200 == 0) {
+				IOLog("MiniIOMobileFramebuffer: flip: surface %u refused (%ux%u, %u bytes a row, scan address %#llx; refusal %u)\n", sid,
+				    s->info.width, s->info.height, s->info.bytesPerRow, (unsigned long long) MiniIOSurfaceScanAddress(s), refused);
+			}
+			MiniIOSurfaceDrop(s);
+			return kIOReturnNoResources;
+		}
+		if (gScanner != NULL && gScanner->fGraphics) {
+			if (!gScanner->scanFrom(s)) {
+				MiniIOSurfaceDrop(s);
+			}
+			return kIOReturnSuccess;
+		}
+		IOLockLock(gGop.lock);
+		old = gScan.next;
+		gScan.next = s;
+		IOLockUnlock(gGop.lock);
+		if (old != NULL) {
+			MiniIOSurfaceDrop(old);
+		}
+		return kIOReturnSuccess;
+	}
+	case 5: {
+		uint32_t sid = 0;
+		uint64_t began = mach_absolute_time(), deadline, now;
+
+		if (gScan.vpu == NULL) {
+			return kIOReturnUnsupported;
+		}
+		if (in == NULL || inSize < sizeof(sid)) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(&sid, in, sizeof(sid));
+		clock_interval_to_deadline(FLIP_WAIT_MS, NSEC_PER_MSEC, &deadline);
+		for (now = began; now < deadline; now = mach_absolute_time()) {
+			bool shown;
+
+			IOLockLock(gGop.lock);
+			shown = (gScan.current != NULL && gScan.current->sid == sid) || (gScan.leaving == sid && now < gScan.leftAt);
+			IOLockUnlock(gGop.lock);
+			if (!shown) {
+				break;
+			}
+			IODelay(200);
+		}
+		if (now != began) {
+			uint64_t nanos;
+
+			absolutetime_to_nanoseconds(now - began, &nanos);
+			gScan.waits++;
+			gScan.waited += (uint32_t) (nanos / NSEC_PER_USEC);
+		}
+		return kIOReturnSuccess;
+	}
+	default:
+		return kIOReturnBadArgument;
+	}
+}
+
+/* true: the presenter put the surface on the panel; false: the caller draws it */
+static bool
+gopOffer(MiniIOSurface * s)
+{
+	uint64_t now = mach_absolute_time(), idle, deadline;
+	bool shown;
+
+	if (gGop.lock == NULL || s->memory == NULL || s->client != NULL) {
+		return false;
+	}
+	nanoseconds_to_absolutetime((uint64_t) GOP_IDLE_MS * NSEC_PER_MSEC, &idle);
+	IOLockLock(gGop.lock);
+	if (gGop.lastWait == 0 || now - gGop.lastWait > idle) {
+		IOLockUnlock(gGop.lock);
+		return false;
+	}
+	s->retain();
+	gGop.offered = s;
+	gGop.handed = gGop.done = false;
+	gGop.status = 1;
+	gGop.sequence++;
+	IOLockWakeup(gGop.lock, &gGop.offered, true);
+	clock_interval_to_deadline(GOP_TAKE_MS, NSEC_PER_MSEC, &deadline);
+	while (!gGop.done) {
+		if (IOLockSleepDeadline(gGop.lock, &gGop.done, deadline, THREAD_UNINT) != THREAD_AWAKENED) {
+			break;
+		}
+	}
+	shown = gGop.done && gGop.status == 0;
+	gGop.offered = NULL;
+	gGop.handed = false;
+	if (gGop.map != NULL) {
+		gGop.map->release();
+		gGop.map = NULL;
+	}
+	shown ? gGop.frames++ : gGop.fallbacks++;
+	if ((gGop.frames + gGop.fallbacks) % 600 == 1) {
+		IOLog("MiniIOMobileFramebuffer: GPU hand-off: %llu frames by the GPU, %llu by the processor\n", gGop.frames, gGop.fallbacks);
+	}
+	IOLockUnlock(gGop.lock);
+	s->release();
+	return shown;
+}
+
+/* Until the encoder is between pictures: a new address then takes effect with no line of two frames on the screen. */
+static void
+waitForBlanking(void)
+{
+	const uint32_t lines = gScan.vpu[ENCP_VIDEO_MAX_LNCNT] + 1, begin = gScan.vpu[ENCP_DE_V_BEGIN], end = gScan.vpu[ENCP_DE_V_END];
+	const uint64_t perLine = (uint64_t) (NSEC_PER_SEC / refreshHz()) / lines;
+	uint64_t ticks, deadline;
+	uint32_t line = gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff;
+
+	if (end <= begin || end >= lines || line >= end || line < begin) {
+		return;
+	}
+	clock_interval_to_deadline(2 * NSEC_PER_SEC / refreshHz() / NSEC_PER_USEC, NSEC_PER_USEC, &deadline);
+	while (mach_absolute_time() < deadline) {
+		line = gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff;
+		if (line >= end || line < begin) {
+			return;
+		}
+		/* asleep for most of the way, which can run over by a millisecond and more; the last of it by the line, past a blanking overslept too */
+		if ((end - line) * perLine > 2500 * NSEC_PER_USEC) {
+			nanoseconds_to_absolutetime((end - line) * perLine - 2000 * NSEC_PER_USEC, &ticks);
+			clock_delay_until(mach_absolute_time() + ticks);
+		} else {
+			IODelay(5);
+		}
+	}
+	gScan.blankMisses++;
+}
+
+/* The display scans this surface from now on; its hold passes to gScan. false: it cannot. */
+bool
+IOMobileFramebuffer::scanFrom(MiniIOSurface * s)
+{
+	uint64_t address = MiniIOSurfaceScanAddress(s);
+
+	if (address == 0) {
+		return false;
+	}
+	if (fStatFlips + fStatFlipsKept == 0 && !fScanning) {
+		IOLog("MiniIOMobileFramebuffer: flip: surface %u at %#llx, line %u\n", s->sid, (unsigned long long) address,
+		    gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff);
+	}
+	uint64_t left;
+	MiniIOSurface * old;
+
+	waitForBlanking();
+	/* (the old surface is done with as the next picture starts, at most the blanking away) */
+	nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC + (uint64_t) gFlipLag * (NSEC_PER_SEC / refreshHz()), &left);
+	gScan.vpu[VIU_OSD1_BLK1_CFG_W4] = (uint32_t) (address >> 4);
+	IOLockLock(gGop.lock);
+	old = gScan.current;
+	gScan.current = s;
+	if (old != NULL && old != s) {
+		gScan.leaving = old->sid;
+		gScan.leftAt = mach_absolute_time() + left;
+	}
+	IOLockUnlock(gGop.lock);
+	if (old != NULL) {
+		MiniIOSurfaceDrop(old);
+	}
+	fScanning = true;
+	fStatFlips++;
+	return true;
+}
+
+/* The display goes back to the panel's memory. */
+void
+IOMobileFramebuffer::scanPanel(void)
+{
+	MiniIOSurface * old;
+
+	gScan.vpu[VIU_OSD1_BLK1_CFG_W4] = (uint32_t) (gGop.panelPhys >> 4);
+	IOLockLock(gGop.lock);
+	old = gScan.current;
+	gScan.current = NULL;
+	IOLockUnlock(gGop.lock);
+	if (old != NULL) {
+		MiniIOSurfaceDrop(old);
+	}
+	fScanning = false;
+	fStatFlipsLeft++;
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -1156,9 +1577,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
-	MiniIOSurface * recorded = NULL;
-	bool report;
+	MiniIOSurface * recorded = NULL, * next = NULL;
+	bool report, scanned = false, alone = true;
+	uint32_t sid = 0;
 
+	if (gScan.vpu != NULL) {
+		IOLockLock(gGop.lock);
+		next = gScan.next;
+		gScan.next = NULL;
+		sid = next == NULL && gScan.current != NULL ? gScan.current->sid : 0;
+		IOLockUnlock(gGop.lock);
+		next = sid != 0 ? MiniIOSurfaceCopy(sid) : next;
+	}
+	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+		alone = alone && swapWord(swap, SWAP_SURFACE(layer)) == 0;
+	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
@@ -1167,7 +1600,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	if (gOnTheBeat && !fScanning) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -1240,7 +1673,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
-		s = surfaces[layer];
+		s = layer == 0 && next != NULL ? next : surfaces[layer];
 		if (report) {
 			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
 			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
@@ -1258,15 +1691,55 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			drawLayer(s, src, dst);
+			bool whole = layer == 0 && (set & ~1u) == 0 && fPacked == NULL && src[0] == 0 && src[1] == 0 && src[2] == (int32_t) s->info.width &&
+			    src[3] == (int32_t) s->info.height && dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) fPanelWidth &&
+			    dst[3] == (int32_t) fPanelHeight && s->info.width == fPanelWidth && s->info.height == fPanelHeight;
+
+			if (whole && alone && fScanning) {
+				/* (the frame goes on the display when the GPU has finished it, and the surface the swap names has not been written) */
+				fStatFlipsKept++;
+				scanned = true;
+			} else if (whole && alone && next != NULL && scanFrom(next)) {
+				next = NULL;
+				scanned = true;
+			} else if (!(whole && gopOffer(s))) {
+				drawLayer(s, src, dst);
+			}
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
+			/* boot-arg fb_probe=1: is there anything in the surface at all (one pixel in 16 x 16) */
+			if (gProbe && layer == 0 && s->kpixels != NULL && (fSwapsShown < 16 || fSwapsShown % 25 == 0)) {
+				uint32_t nonzero = 0, opaque = 0, samples = 0, first = 0;
+
+				for (uint32_t y = 0; y < s->info.height; y += 16) {
+					for (uint32_t x = 0; x < s->info.width; x += 16) {
+						uint32_t v = *(const uint32_t *)(s->kpixels + (size_t) y * s->info.bytesPerRow + (size_t) x * 4);
+
+						samples++;
+						nonzero += v != 0;
+						opaque += (v >> 24) != 0;
+						first = first == 0 ? v : first;
+					}
+				}
+				IOLog("MiniIOMobileFramebuffer: probe swap %u surface %u: %u of %u samples non-zero, %u with alpha, first %#x\n",
+				    swapWord(swap, SWAP_ID), sid, nonzero, samples, opaque, first);
+
+			}
 		}
+	}
+	if (fPacked != NULL) {
+		packFrame();
+	}
+	if (fScanning && !scanned) {
+		scanPanel();
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
+	}
+	if (next != NULL) {
+		MiniIOSurfaceDrop(next);
 	}
 	fSwapsShown++;
 	if (gTouchLat) {
@@ -1315,6 +1788,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    fStatSurfaces[4], made, making, again, freed, freeing);
 		}
 		bzero(fStatSurfaces, sizeof(fStatSurfaces));
+		if (gScan.vpu != NULL) {
+			IOLog("MiniIOMobileFramebuffer: flip: %u frames flipped, %u kept, left the panel's memory %u times, line %u of %u; "
+			    "%u waits for a surface to leave the display, %u us each; %u flips missed the blanking\n", fStatFlips, fStatFlipsKept, fStatFlipsLeft,
+			    gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff, gScan.vpu[ENCP_VIDEO_MAX_LNCNT] + 1, gScan.waits,
+			    gScan.waits ? gScan.waited / gScan.waits : 0, gScan.blankMisses);
+			gScan.blankMisses = 0;
+			fStatFlips = fStatFlipsKept = fStatFlipsLeft = 0;
+			gScan.waits = gScan.waited = 0;
+		}
 		fStatHeld = fStatLost = fStatOnBeat = fStatSettled = 0;
 		fStatWaiting = fStatBeatWait = 0;
 		reportFrameTimes();
@@ -1728,9 +2210,9 @@ publishAccelerator(IOService * provider)
 		 * Metal for the screen; until that device can draw, a screen drawn without it is the working one.
 		 */
 		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0) {
-			accelerator->setProperty("MetalPluginName", "HakiosMetal");
-			accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice");
-			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names HakiosMetal as its Metal plug-in\n");
+			accelerator->setProperty("MetalPluginName", "NativeMaliMetal");
+			accelerator->setProperty("MetalPluginClassName", "NativeMaliMetalDevice");
+			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names NativeMaliMetal (the Mali-G310's, over PanVK) as its Metal plug-in\n");
 		}
 		accelerator->registerService();
 	}

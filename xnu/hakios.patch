@@ -119,10 +119,10 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..27cccab98c8e 100644
+index 44274016a4cf..5f092db13ec7 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,51 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,59 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -131,11 +131,19 @@ index 44274016a4cf..27cccab98c8e 100644
 +bsd/dev/hakios.version.c                 standard
 +bsd/dev/hakios.platform.c                standard
 +bsd/dev/hakios.stubs.c                   standard
++bsd/dev/hakios.hdmitx.c                  standard
 +bsd/dev/hakios.input.c                   standard
++bsd/dev/hakios.crgudc.c                  standard
++bsd/dev/hakios.cec.c                     standard
 +bsd/dev/hakios.net.c                     standard
 +bsd/dev/hakios.image.c                   standard
 +bsd/dev/hakios.sparse.c                  standard
 +bsd/dev/hakios.apfs_check.c              optional apfs
++bsd/dev/hakios.emmc.c                    standard
++bsd/dev/hakios.xhci.c                    standard
++bsd/dev/hakios.w2.c                      standard
++bsd/dev/hakios.w2wpa.c                   standard
++bsd/dev/hakios.w2bt.c                    standard
 +bsd/dev/hakios.adsp.c                    optional hakios_adsp
 +bsd/dev/hakios.speaker.c                 optional hakios_speaker
 +bsd/dev/hakios.sound.c                   optional hakios_sound
@@ -174,7 +182,7 @@ index 44274016a4cf..27cccab98c8e 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +200,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +208,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -227,7 +235,7 @@ index 44274016a4cf..27cccab98c8e 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +452,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +460,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -235,7 +243,7 @@ index 44274016a4cf..27cccab98c8e 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +475,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +483,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -462,16 +470,21 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..b5a79a02a3f5 100644
+index 4df41ba1f61b..5da2fb6522b2 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,14 @@
+@@ -147,6 +147,19 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 +#include <sys/hakios.input.h>
 +#include <sys/hakios.audio.h>
 +#include <sys/hakios.virtio_blk.h>
++#include <sys/hakios.emmc.h>
++#include <sys/hakios.crgudc.h>
++#include <sys/hakios.cec.h>
++#include <sys/hakios.hdmitx.h>
++#include <sys/hakios.xhci.h>
 +#include <sys/hakios.sparse.h>
 +#include <sys/hakios.version.h>
 +#if APFS
@@ -480,7 +493,7 @@ index 4df41ba1f61b..b5a79a02a3f5 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +498,7 @@ bsd_init(void)
+@@ -490,7 +503,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -489,7 +502,7 @@ index 4df41ba1f61b..b5a79a02a3f5 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +984,15 @@ bsd_init(void)
+@@ -976,6 +989,21 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -497,6 +510,12 @@ index 4df41ba1f61b..b5a79a02a3f5 100644
 +		hakios_input_init();           /* /dev/hakios-touch */
 +		hakios_audio_init();           /* /dev/hakios-audio */
 +		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
++		hakios_emmc_init();            /* /dev/emmc_darwin, the Amlogic box's eMMC */
++		hakios_crgudc_init();          /* keys from the host over the box's USB port */
++		hakios_hdmitx_init();          /* the HDMI transmitter: its mode and the TV's EDID (before CEC: the physical address) */
++		hakios_cec_init();             /* the TV's remote over HDMI-CEC */
++		hakios_xhci_init();            /* the internal USB host and the W2 on it */
++		mali_start();                  /* the Mali GPU of the Amlogic box (mali=N) */
 +		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 +#if APFS
 +		/* mounts and walks /dev/rvblk0 once userland has /private/var up */
@@ -1900,10 +1919,10 @@ index 83259ebf9835..8864e5c7cc41 100644
  DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
  endif
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..7cfee3142b5b 100644
+index 5fb0a52062e0..1a26025334bf 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,17 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,20 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1911,7 +1930,10 @@ index 5fb0a52062e0..7cfee3142b5b 100644
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 +# HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
++iokit/Kernel/hakios.btsvc.cpp            optional iokitcpp
++iokit/Kernel/hakios.hidres.cpp           optional iokitcpp
 +iokit/Kernel/hakios.stubs.cpp            optional iokitcpp
++iokit/Kernel/hakios.mali.cpp             optional iokitcpp
 +iokit/Kernel/hakios.gpu.cpp              optional hakios_adreno iokitcpp
 +iokit/Kernel/hakios.battery.cpp          optional hakios_battery iokitcpp
 +iokit/Kernel/hakios.wlan.cpp             optional hakios_wifi iokitcpp
@@ -2595,6 +2617,19 @@ index e76e7e70ab9c..828a51171c7e 100644
  }
  
  void
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 133b07fd6155..cae3e880b899 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -644,7 +644,7 @@
+ #endif
+ 
+ #define SCTLR_EL1_DEFAULT \
+-	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
++	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_UCT_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
+ 	 SCTLR_I_ENABLED | SCTLR_SED_DISABLED | SCTLR_CP15BEN_ENABLED |                    \
+ 	 SCTLR_SA0_ENABLED | SCTLR_SA_ENABLED | SCTLR_C_ENABLED | SCTLR_M_ENABLED |        \
+ 	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT |                                        \
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5a1cce..a54e35035cde 100644
 --- a/osfmk/arm64/start.s

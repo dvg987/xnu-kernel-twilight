@@ -1996,6 +1996,14 @@ IOReturn MaliClient::gopCall(const mali_gop_in &in, union mali_gop_out *out, uin
       struct { uint64_t sequence; uint32_t status, reserved; } done = {in.arg, in.status, 0};
       return native_gop_handoff_call(3, ownerTask, &done, sizeof done, nullptr, 0);
     }
+    case MALI_GOP_FLIP: {
+      const uint32_t surface = static_cast<uint32_t>(in.arg);
+      return native_gop_handoff_call(4, ownerTask, &surface, sizeof surface, nullptr, 0);
+    }
+    case MALI_GOP_FLIP_WAIT: {
+      const uint32_t surface = static_cast<uint32_t>(in.arg);
+      return native_gop_handoff_call(5, ownerTask, &surface, sizeof surface, nullptr, 0);
+    }
     default: return kIOReturnBadArgument;
   }
 }

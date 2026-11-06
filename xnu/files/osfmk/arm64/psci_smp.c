@@ -76,7 +76,8 @@ struct psci_smp_start_fault {
 _Static_assert(sizeof(struct psci_smp_start_fault) == 64, "one cache line");
 
 static uint32_t psci_smp_cpu_stage[MAX_CPUS];   /* PSCI_SMP_CPU_*, by cpu number */
-static uint32_t psci_smp_started;               /* a bit per core that CPU_ON was granted for */
+static uint32_t psci_smp_started;
+static uint64_t psci_smp_el2_trampoline;          /* 0: CPU_ON straight into the reset vector */               /* a bit per core that CPU_ON was granted for */
 
 static int      psci_smp_stop_owner = -1;       /* the processor that began the return to the boot loader */
 static bool     psci_smp_boot_wanted;           /* it was not the boot processor: that one is to finish */
@@ -123,6 +124,15 @@ psci_smp_init(void)
 	    SecureDTGetProperty(chosen, "psci-method", &prop, &size) == kSuccess &&
 	    size >= 3 && strncmp((const char *)prop, "hvc", 3) == 0) {
 		psci_smp_hvc = 1;
+	}
+	/*
+	 * A loader that leaves the kernel at EL1 under EL2 (twloader on the Amlogic box, QEMU with
+	 * virtualization=on) has PSCI start the other cores at EL2: they go through its trampoline,
+	 * which sets EL1 up as it did for the boot core and enters the reset vector there.
+	 */
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "psci-el2-trampoline", &prop, &size) == kSuccess && size == sizeof(uint64_t)) {
+		psci_smp_el2_trampoline = *(const uint64_t *)prop;
 	}
 }
 
@@ -186,7 +196,11 @@ psci_smp_start_cpu(int cpu)
 	__builtin_arm_dsb(DSB_SY);
 
 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
-	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+	if (psci_smp_el2_trampoline != 0) {
+		status = psci_call(PSCI_CPU_ON, phys_id, psci_smp_el2_trampoline, entry);
+	} else {
+		status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+	}
 	if (status != 0) {
 		os_atomic_store(&psci_smp_cpu_stage[cpu], 0, release);
 		printf("psci: cpu %d (MPIDR 0x%x) was not started: the firmware answers %lld (%s)\n",

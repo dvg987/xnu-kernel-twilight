@@ -156,6 +156,8 @@ public:
  * A surface found or made here is held until MiniIOSurfaceDrop().
  */
 MiniIOSurface * MiniIOSurfaceCopy(uint32_t sid);
+/* The physical address of the pixels, if they lie in one piece the display can scan; 0 if not. */
+uint64_t        MiniIOSurfaceScanAddress(MiniIOSurface * surface);
 /*
  * What making and freeing surfaces has cost since this was last asked: how many, microseconds
  * each; how many got memory that was kept from one before.

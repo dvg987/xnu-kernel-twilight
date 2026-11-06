@@ -30,6 +30,11 @@
 
 #include "MiniIOSurface.h"
 
+extern "C" {
+#include <console/video_console.h>
+extern struct vc_info vinfo;            /* the boot framebuffer: the panel's size */
+}
+
 static_assert(sizeof(struct minisurf_plane) == 0x80, "plane layout");
 static_assert(sizeof(struct minisurf_result) == 0x68, "result layout");
 static_assert(offsetof(struct minisurf_shared, attachments) == 0x30, "shared layout");
@@ -183,13 +188,39 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
 	MiniIOSurfaceClearKept();
 }
 
+/*
+ * Boot-arg fb_flip=1: the display scans the window server's frames where they were drawn, so the surfaces of the panel's size
+ * are physically contiguous. That much in one piece is not to be had once the system runs: it is set aside when the driver starts.
+ */
+static TUNABLE(uint32_t, gSurfaceFlip, "fb_flip", 0);
+#define SURFACES_SCANNED        4
+static struct {
+	IOBufferMemoryDescriptor *      memory;         /* (one reference is this table's) */
+	bool                            taken;
+} gSurfaceScanned[SURFACES_SCANNED];
+
 /* Memory for a surface: the state page and `bytes` after it, all zeroes. */
 static IOBufferMemoryDescriptor *
-surfaceMemory(vm_size_t bytes)
+surfaceMemory(vm_size_t bytes, bool scanned)
 {
 	IOBufferMemoryDescriptor * memory = NULL;
 	bool clear = false;
 
+	if (scanned && gSurfaceKeptLock != NULL) {
+		IOLockLock(gSurfaceKeptLock);
+		for (unsigned i = 0; i < SURFACES_SCANNED && memory == NULL; i++) {
+			if (gSurfaceScanned[i].memory != NULL && !gSurfaceScanned[i].taken && gSurfaceScanned[i].memory->getCapacity() == bytes) {
+				gSurfaceScanned[i].taken = true;
+				memory = gSurfaceScanned[i].memory;
+				memory->retain();
+			}
+		}
+		IOLockUnlock(gSurfaceKeptLock);
+		if (memory != NULL) {
+			bzero(memory->getBytesNoCopy(), bytes);
+			return memory;
+		}
+	}
 	if (bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
 		IOLockLock(gSurfaceKeptLock);
 		for (int pass = 0; pass < 2 && memory == NULL; pass++) {
@@ -227,6 +258,19 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 {
 	IOBufferMemoryDescriptor * evicted = NULL;
 
+	if (gSurfaceKeptLock != NULL) {
+		IOLockLock(gSurfaceKeptLock);
+		for (unsigned i = 0; i < SURFACES_SCANNED; i++) {
+			if (gSurfaceScanned[i].memory == memory) {
+				/* (still mapped somewhere: not for the next surface; it stays taken) */
+				gSurfaceScanned[i].taken = memory->getRetainCount() != 2;
+				IOLockUnlock(gSurfaceKeptLock);
+				memory->release();
+				return;
+			}
+		}
+		IOLockUnlock(gSurfaceKeptLock);
+	}
 	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
 		OSIncrementAtomic(&gSurfacesNotKept[0]);
 	}
@@ -632,7 +676,9 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		}
 	}
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	bool scanned = gSurfaceFlip && wrapped == NULL && width == vinfo.v_width && height == vinfo.v_height;
+
+	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc), scanned);
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -745,6 +791,19 @@ surfaceUnhold(MiniIOSurface * s)
 	gSurfaceCount--;
 	gSurfaceBytes -= s->info.allocSize;
 	s->release();
+}
+
+uint64_t
+MiniIOSurfaceScanAddress(MiniIOSurface * s)
+{
+	IOByteCount length = 0;
+	uint64_t address;
+
+	if (s->memory == NULL || s->client != NULL) {
+		return 0;
+	}
+	address = s->memory->getPhysicalSegment(PAGE_SIZE + s->info.offset, &length, kIOMemoryMapperNone);
+	return length >= (uint64_t) s->info.bytesPerRow * s->info.height ? address : 0;
 }
 
 MiniIOSurface *
@@ -862,6 +921,17 @@ MiniIOSurfaceStart(IOService * provider)
 
 	gSurfaceLock = IOLockAlloc();
 	gSurfaceKeptLock = IOLockAlloc();
+	if (gSurfaceFlip) {
+		vm_size_t bytes = PAGE_SIZE + round_page((vm_size_t) vinfo.v_width * vinfo.v_height * 4);
+		unsigned made = 0;
+
+		for (unsigned i = 0; i < SURFACES_SCANNED; i++) {
+			gSurfaceScanned[i].memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+			    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0x000000fffffff000ULL);
+			made += gSurfaceScanned[i].memory != NULL;
+		}
+		IOLog("MiniIOSurface: fb_flip=1: %u of %u pieces of %lu bytes for the display to scan\n", made, SURFACES_SCANNED, (unsigned long) bytes);
+	}
 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
 		gSurfaceTraceOf[0] = 0;
 	}

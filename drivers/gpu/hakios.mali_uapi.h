@@ -72,7 +72,7 @@ struct mali_log_in { char text[200]; };
 //   op 2 (wait)     arg = timeout in ms (at most 1000); out.swap: the frame's pages are mapped into the caller at swap.address, bytes long;
 //                   kIOReturnTimeout when there was none (the normal answer of an idle display)
 //   op 3 (complete) arg = swap.sequence, status 0 = the copy is in the scanout (anything else: the display driver falls back to its own copy); no out
-enum { MALI_GOP_MODE = 0, MALI_GOP_WAIT = 2, MALI_GOP_COMPLETE = 3 };
+enum { MALI_GOP_MODE = 0, MALI_GOP_WAIT = 2, MALI_GOP_COMPLETE = 3, MALI_GOP_FLIP = 4, MALI_GOP_FLIP_WAIT = 5 };   // FLIP: arg the surface drawn, for the display to scan; FLIP_WAIT: until that surface has left the display
 struct mali_gop_in { uint32_t op, status; uint64_t arg; };
 struct mali_gop_mode { uint32_t version, format; uint64_t width, height, stride, bytes; };   // format 1: BGRX8888
 struct mali_gop_swap { uint64_t sequence, address, bytes, stride; uint32_t width, height, format, reserved; };
