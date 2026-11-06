@@ -28,6 +28,8 @@
 #include <vm/vm_kern.h>
 #include <arm/caches_internal.h>
 
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void IOSleep(unsigned int milliseconds);
@@ -1195,7 +1197,7 @@ hakios_xhci_init(void)
 	x.pad = ml_io_map(PAD_BASE, 0x1000);
 	x.trim = ml_io_map(TRIM_BASE, 0x1000);
 	printf("xhci: w2=%u, block at %#llx\n", x.step, x.pa);
-	if (kernel_thread_start(xhci_thread, NULL, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start_priority(xhci_thread, NULL, HAKIOS_POLL_PRI, &thread) == KERN_SUCCESS) {   /* (HAKIOS_POLL_PRI: below the window server's render threads) */
 		thread_set_thread_name(thread, "xhci");
 		thread_deallocate(thread);
 	}

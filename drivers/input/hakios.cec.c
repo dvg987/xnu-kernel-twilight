@@ -28,6 +28,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
 
 #define CEC_AO_BASE     0xfe044000UL
 #define AO_CECB_GEN_CNTL        0x40
@@ -473,7 +474,7 @@ hakios_cec_init(void)
 	controller_reset();
 	printf("cec: controller up (gen_cntl %#x)\n", rd32(c.ao, AO_CECB_GEN_CNTL));
 
-	if (kernel_thread_start(cec_thread, NULL, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start_priority(cec_thread, NULL, HAKIOS_POLL_PRI, &thread) == KERN_SUCCESS) {   /* (HAKIOS_POLL_PRI: below the window server's render threads) */
 		thread_set_thread_name(thread, "cec");
 		thread_deallocate(thread);
 	}

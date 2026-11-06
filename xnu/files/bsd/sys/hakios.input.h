@@ -36,6 +36,11 @@ struct hakios_touch {
 };
 
 #ifdef KERNEL
+/*
+ * The priority of the drivers' polling threads (Wi-Fi/Bluetooth, USB keys, CEC): above the apps' interactive threads (46, 47),
+ * below the window server's render threads (54), which wait for nothing of theirs.
+ */
+#define HAKIOS_POLL_PRI 50
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hakios_input_init(void);

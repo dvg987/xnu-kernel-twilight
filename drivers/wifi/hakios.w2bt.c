@@ -33,6 +33,8 @@
 #include <sys/kpi_mbuf.h>
 #include <kern/locks.h>
 
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
+
 extern void HakiosBluetoothStart(const uint8_t *address);  /* hakios.btsvc.cpp */
 
 extern void IOSleep(unsigned int milliseconds);
@@ -1443,7 +1445,7 @@ hakios_w2bt_start(void)
 	if (b.step == 3) {
 		uart_register();
 	}
-	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start_priority(bt_thread, NULL, HAKIOS_POLL_PRI, &thread) == KERN_SUCCESS) {   /* (HAKIOS_POLL_PRI: below the window server's render threads) */
 		thread_set_thread_name(thread, "w2 bt");
 		thread_deallocate(thread);
 	}

@@ -26,6 +26,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
 extern void loader_return_now(void);
 
 #define RECORD_STOP     9
@@ -494,7 +495,7 @@ hakios_crgudc_init(void)
 	wr(R_CONTROL, rd(R_CONTROL) | CTRL_RUN);
 	printf("usbkeys: controller running (portsc %#x, block at %#llx)\n", rd(R_PORTSC), u.pa);
 
-	if (kernel_thread_start(usbkeys_thread, NULL, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start_priority(usbkeys_thread, NULL, HAKIOS_POLL_PRI, &thread) == KERN_SUCCESS) {   /* (HAKIOS_POLL_PRI: below the window server's render threads) */
 		thread_set_thread_name(thread, "usb keys");
 		thread_deallocate(thread);
 	}
