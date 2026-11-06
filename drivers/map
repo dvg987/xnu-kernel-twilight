@@ -27,6 +27,8 @@ gpu      iokit/Kernel/hakios.gpu.cpp
 gpu      iokit/Kernel/hakios.mali.cpp
 gpu iokit/Kernel/hakios.mali_uapi.h
 gpu      bsd/dev/hakios.hdmitx.c
+gpu      bsd/dev/hakios.vdec.c
+gpu      bsd/dev/hakios.optee.c
 
 camera   bsd/dev/hakios.camera.c
 camera   bsd/dev/hakios.torch.c

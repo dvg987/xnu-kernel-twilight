@@ -358,6 +358,7 @@ ring_service(void)
 }
 
 static unsigned diag_ticks;
+static uint32_t diag_every;              /* hdmiaudio_diag=1: the diagnostic lines every second; else once, as a stream starts */
 
 /* Once a second while a stream plays: where the FIFO reads, where we write, and the registers of the path */
 static void
@@ -392,7 +393,7 @@ ring_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	lck_mtx_lock(&ha_lock);
 	if (s.running) {
 		ring_service();
-		if (++diag_ticks % (1000 / TICK_MS) == 1) {
+		if (++diag_ticks == 1 || (diag_every && diag_ticks % (1000 / TICK_MS) == 1)) {
 			diagnose();
 		}
 		clock_interval_to_deadline(TICK_MS, NSEC_PER_MSEC, &deadline);
@@ -518,6 +519,7 @@ stream_start_locked(const struct twl_audio_format *f)
 	}
 	path_go();
 	s.running = true;
+	diag_ticks = 0;
 	if (!s.armed) {
 		uint64_t deadline;
 
@@ -700,6 +702,7 @@ hakios_hdmiaudio_init(void)
 	uint32_t level = 0, secs = 5, ch = 2, pll = 0, gate = 0, src = 4, delay = 0;
 	int major;
 
+	(void)PE_parse_boot_argn("hdmiaudio_diag", &diag_every, sizeof(diag_every));
 	if (!PE_parse_boot_argn("hdmiaudio", &level, sizeof(level)) || level == 0) {
 		return;
 	}

@@ -13,3 +13,10 @@ standard iokit/Kernel/hakios.mali.cpp iokitcpp
 
 standard bsd/dev/hakios.hdmitx.c
 	help    the Amlogic box's HDMI transmitter (hdmitx=1): the mode U-Boot left and the TV's EDID, read through the SiP calls
+
+standard bsd/dev/hakios.vdec.c
+	help    the Amlogic box's video decoders (vdec=1): the DOS block's power, clocks and reset, its registers read back
+
+standard bsd/dev/hakios.optee.c
+	help    a minimal OP-TEE client (optee=N): the secure world's identity and capabilities, and the video decoders'
+	help    firmware handed to the video TA (fw/526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta, fw/video_ucode.bin)

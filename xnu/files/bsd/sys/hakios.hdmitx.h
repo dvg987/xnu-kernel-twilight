@@ -61,6 +61,7 @@ bool hakios_hdmitx_audio_start(const struct hakios_hdmitx_audio *a);      /* N/C
 void hakios_hdmitx_audio_stop(void);               /* muted */
 void hakios_hdmitx_audio_show(void);               /* its audio registers, in the log */
 void hakios_hdmiaudio_init(void);                  /* hakios.hdmiaudio.c, boot-arg hdmiaudio=N: at the end of hakios_hdmitx_init() */
+void hakios_vdec_init(void);                       /* hakios.vdec.c, boot-arg vdec=N: after hakios_hdmiaudio_init() */
 const char *hakios_hdmitx_tv(bool *pq, bool *hlg, bool *bt2020);           /* the TV's name and HDR */
 #endif
 

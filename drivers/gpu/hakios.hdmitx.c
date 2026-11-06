@@ -23,6 +23,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
+extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
 
 #define TOP_BASE        0xfe300000UL
 #define COR_BASE        0xfe310000UL
@@ -700,6 +701,15 @@ hakios_hdmitx_audio_start(const struct hakios_hdmitx_audio *a)
 	chst[1] = 0x01;
 	chst[3] = a->rate >= 192000 ? 0x0e : a->rate >= 176400 ? 0x0c : a->rate >= 96000 ? 0x0a : a->rate >= 88200 ? 0x08 :
 	    a->rate >= 48000 ? 0x02 : a->rate >= 44100 ? 0x00 : 0x03;
+	if (a->nonaudio) {
+		/* as Amlogic's iec_get_channel_status_info(): HBR streams say 768 kHz, original 192; E-AC-3 in 192 kHz frames and AC-3 original 48; 16-bit word */
+		if (a->hbr) {
+			chst[3] = 0x09;
+			chst[4] = 0x02 | 0x10;
+		} else {
+			chst[4] = 0x02 | 0xd0;
+		}
+	}
 	printf("hdmitx: audio: %u Hz, %u ch%s%s, TMDS %u kHz%s, N %u, %u lane(s)\n", a->rate, a->channels, a->hbr ? ", HBR" : "",
 	    a->nonaudio ? ", IEC 61937" : "", tmds, deep ? " (deep colour)" : "", n, lines);
 
@@ -848,6 +858,140 @@ hakios_hdmiaudio_init(void)
 {
 }
 
+/*
+ * SCDC (HDMI 2.0 status and control, I2C address 0xa8 on the DDC): above 340 MHz of TMDS clock -- 2160p60 -- the
+ * sink has to be told that the source scrambles and sends the clock at 1/40 (TMDS_CONFIG, offset 0x20 = 0x03).
+ * U-Boot tells it once; a TV that switches inputs, sleeps or is unplugged forgets it, and shows "no signal" for a
+ * stream it can no longer descramble. Here a thread looks every second (and right after the hot-plug line rises
+ * again) and tells it again when it has forgotten. Amlogic's hdmi_tx_ddc.c: _hdmitx_ddcm_write_, hdmitx_ddcm_read.
+ */
+#define SCDC_ADDR       0xa8
+#define SCDC_TMDS_CFG   0x20
+#define SCDC_STATUS0    0x40
+
+static bool
+ddc_idle(void)
+{
+	for (unsigned ms = 0; cor_rd(DDC_STATUS) & DDC_INPROG; ms++) {
+		if (ms == 20) {
+			cor_wr(TPI_DDC_MASTER_EN, cor_rd(TPI_DDC_MASTER_EN) | 0x80);
+			cor_wr(DDC_CMD, 0x0f);
+			cor_wr(DDC_CMD, 0x0a);
+			cor_wr(TPI_DDC_MASTER_EN, cor_rd(TPI_DDC_MASTER_EN) & ~0x80);
+			return false;
+		}
+		IOSleep(1);
+	}
+	return true;
+}
+
+static bool
+scdc_read(uint8_t offset, uint8_t *value)
+{
+	bool ok = false;
+
+	if (!ddc_idle()) {
+		return false;
+	}
+	cor_wr(TPI_DDC_MASTER_EN, cor_rd(TPI_DDC_MASTER_EN) | 0x80);
+	cor_wr(DDC_ADDR, SCDC_ADDR);
+	cor_wr(DDC_SEGM, 0);
+	cor_wr(DDC_OFFSET, offset);
+	cor_wr(DDC_CMD, 0x09);                                  /* clear the FIFO */
+	cor_wr(DDC_DIN_CNT2, 0);
+	cor_wr(DDC_DIN_CNT1, 1);
+	cor_wr(DDC_CMD, 0x02);                                  /* sequential read */
+	for (unsigned ms = 0; ms < 20; ms++) {
+		IOSleep(1);
+		if (cor_rd(DDC_STATUS) & (DDC_NACK | DDC_BUSLOW)) {
+			cor_wr(DDC_STATUS, 0);
+			break;
+		}
+		if (cor_rd(DDC_DOUT_CNT) & 0x1f) {
+			*value = cor_rd(DDC_DATA_AON);
+			ok = true;
+			break;
+		}
+	}
+	if (!ok) {
+		cor_wr(DDC_CMD, 0x0f);
+		cor_wr(DDC_CMD, 0x0a);
+	}
+	cor_wr(TPI_DDC_MASTER_EN, cor_rd(TPI_DDC_MASTER_EN) & ~0x80);
+	return ok;
+}
+
+static bool
+scdc_write(uint8_t offset, uint8_t value)
+{
+	bool ok;
+
+	if (!ddc_idle()) {
+		return false;
+	}
+	cor_wr(TPI_DDC_MASTER_EN, cor_rd(TPI_DDC_MASTER_EN) | 0x80);
+	cor_wr(DDC_ADDR, SCDC_ADDR);
+	cor_wr(DDC_SEGM, 0);
+	cor_wr(DDC_OFFSET, offset);
+	cor_wr(DDC_CMD, 0x09 | 0x30);                           /* clear the FIFO */
+	cor_wr(DDC_DIN_CNT2, 0);
+	cor_wr(DDC_DIN_CNT1, 1);
+	cor_wr(DDC_DATA_AON, value);
+	cor_wr(DDC_CMD, 0x06 | 0x30);                           /* sequential write, acks ignored */
+	IOSleep(3);
+	ok = (cor_rd(DDC_STATUS) & (DDC_NACK | DDC_BUSLOW)) == 0;
+	if (!ok) {
+		cor_wr(DDC_STATUS, 0);
+		cor_wr(DDC_CMD, 0x0f);
+		cor_wr(DDC_CMD, 0x0a);
+	}
+	cor_wr(TPI_DDC_MASTER_EN, cor_rd(TPI_DDC_MASTER_EN) & ~0x80);
+	return ok;
+}
+
+static void
+scdc_watch(void *arg __unused, wait_result_t wr __unused)
+{
+	bool hpd_was = true;
+	unsigned fixes = 0;
+
+	for (;;) {
+		bool hpd = (rd(h.pad, GPIOH_I) & (1u << 2)) != 0;
+		uint8_t cfg = 0, st = 0;
+
+		if (hpd != hpd_was) {
+			printf("hdmitx: hot-plug %s\n", hpd ? "back: a TV again" : "low: the TV let go");
+			hpd_was = hpd;
+			if (hpd) {
+				IOSleep(300);                   /* the sink's DDC wakes after the line */
+			}
+		}
+		if (hpd && (cor_rd(SCRCTL) & 1) && scdc_read(SCDC_TMDS_CFG, &cfg) && (cfg & 3) != 3) {
+			bool ok = scdc_write(SCDC_TMDS_CFG, 0x03);
+
+			(void)scdc_read(SCDC_STATUS0, &st);
+			printf("hdmitx: the TV had forgotten scrambling (TMDS_CONFIG %#x): told again, %s; status %#x (%u)\n",
+			    cfg, ok ? "acked" : "NOT acked", st, ++fixes);
+		}
+		IOSleep(1000);
+	}
+}
+
+static void
+scdc_watch_start(void)
+{
+	uint32_t on = 1;
+	thread_t thread;
+
+	(void)PE_parse_boot_argn("hdmitx_scdc", &on, sizeof(on));
+	if (on == 0) {
+		return;
+	}
+	if (kernel_thread_start(scdc_watch, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 void
 hakios_hdmitx_init(void)
 {
@@ -867,5 +1011,7 @@ hakios_hdmitx_init(void)
 	show_state();
 	read_edid();
 	make_timings();
+	scdc_watch_start();
 	hakios_hdmiaudio_init();
+	hakios_vdec_init();
 }

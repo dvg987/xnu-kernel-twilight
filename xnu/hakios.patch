@@ -119,19 +119,22 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..5f092db13ec7 100644
+index 44274016a4cf..7c0e919d593c 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,59 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,62 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
 +# HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
 +bsd/dev/hakios.audio.c                   standard
++bsd/dev/hakios.hdmiaudio.c               standard
 +bsd/dev/hakios.version.c                 standard
 +bsd/dev/hakios.platform.c                standard
 +bsd/dev/hakios.stubs.c                   standard
 +bsd/dev/hakios.hdmitx.c                  standard
++bsd/dev/hakios.vdec.c                    standard
++bsd/dev/hakios.optee.c                   standard
 +bsd/dev/hakios.input.c                   standard
 +bsd/dev/hakios.crgudc.c                  standard
 +bsd/dev/hakios.cec.c                     standard
@@ -182,7 +185,7 @@ index 44274016a4cf..5f092db13ec7 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +208,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +211,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -235,7 +238,7 @@ index 44274016a4cf..5f092db13ec7 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +460,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +463,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -243,7 +246,7 @@ index 44274016a4cf..5f092db13ec7 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +483,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +486,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -470,10 +473,10 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..5da2fb6522b2 100644
+index 4df41ba1f61b..b44d7994e0b4 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,19 @@
+@@ -147,6 +147,21 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
@@ -484,7 +487,9 @@ index 4df41ba1f61b..5da2fb6522b2 100644
 +#include <sys/hakios.crgudc.h>
 +#include <sys/hakios.cec.h>
 +#include <sys/hakios.hdmitx.h>
++extern void hakios_cpusample_start(void);
 +#include <sys/hakios.xhci.h>
++#include <sys/hakios.optee.h>
 +#include <sys/hakios.sparse.h>
 +#include <sys/hakios.version.h>
 +#if APFS
@@ -493,7 +498,7 @@ index 4df41ba1f61b..5da2fb6522b2 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +503,7 @@ bsd_init(void)
+@@ -490,7 +505,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -502,7 +507,7 @@ index 4df41ba1f61b..5da2fb6522b2 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +989,21 @@ bsd_init(void)
+@@ -976,6 +991,23 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -515,7 +520,9 @@ index 4df41ba1f61b..5da2fb6522b2 100644
 +		hakios_hdmitx_init();          /* the HDMI transmitter: its mode and the TV's EDID (before CEC: the physical address) */
 +		hakios_cec_init();             /* the TV's remote over HDMI-CEC */
 +		hakios_xhci_init();            /* the internal USB host and the W2 on it */
++		hakios_optee_init();           /* OP-TEE: the video decoders' firmware through the secure world (optee=N) */
 +		mali_start();                  /* the Mali GPU of the Amlogic box (mali=N) */
++		hakios_cpusample_start();       /* cpu-sample=1: what the processors run, each second */
 +		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 +#if APFS
 +		/* mounts and walks /dev/rvblk0 once userland has /private/var up */
@@ -2992,7 +2999,7 @@ index 9d98c50094a0..9e3476124e54 100644
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index c40d57bcc677..1b7a1fcdfcdf 100644
+index c40d57bcc677..87843f029a0c 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -25,8 +25,8 @@ osfmk/arm64/WKdmCompress_4k.s	standard
@@ -3006,7 +3013,7 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,8 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +104,9 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
@@ -3015,6 +3022,7 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
++osfmk/arm64/hakios_cpusample.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index 384118e8d7a9..2573d2ebd4e6 100644
 --- a/osfmk/console/video_console.c
