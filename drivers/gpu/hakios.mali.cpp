@@ -1336,6 +1336,10 @@ struct Group {
   Mem sync;               // one { seqno, status } pair of 16 bytes per queue (Panthor's panthor_syncobj_64b)
   uint64_t syncVa;
   uint64_t serial;        // never repeats: tells a group from the one that had its place before (the display's fence)
+  bool display;           // the window server's (backboardd): the higher band of slot priorities, and the watchdog's last choice
+  bool lost;              // taken off the GPU by the hang watchdog: no more jobs (mali_group_state_out)
+  uint32_t lostQueues;
+  uint64_t progressDone, progressAt;   // the watchdog's view: jobs done over all queues when it last moved, and when (cntvct)
 };
 uint64_t gGroupSerial;
 Group gGroup[kMaxGroupObjs];
@@ -1470,7 +1474,12 @@ bool groupStart(Group &g, unsigned csg) {
   s.in->allowCompute = gp.computeMask;
   s.in->allowFragment = gp.fragmentMask;
   s.in->allowOther = gp.tilerMask;
-  s.in->endpointReq = (gp.maxCompute & 0xffu) | ((gp.maxFragment & 0xffu) << 8) | ((gp.maxTiler & 0xffu) << 16) | ((gp.priority & 0xfu) << 28);
+  // Every group in a slot has a priority of its own (Panthor's tick: 15 down, one a slot). The firmware hands the GPU's units (one compute, one
+  // fragment and one tiler endpoint on the G310) to the highest that asks; with equal priorities it split them, and Kodi's group sat on compute +
+  // fragment waiting for the tiler while the window server's held the tiler waiting for the other two: the screen froze. The window server's
+  // groups take 15..8, everyone else's 7..0.
+  const unsigned slotPriority = (g.display ? 15u : 7u) - (csg & 7u);
+  s.in->endpointReq = (gp.maxCompute & 0xffu) | ((gp.maxFragment & 0xffu) << 8) | ((gp.maxTiler & 0xffu) << 16) | (slotPriority << 28);
   s.in->config = ctx.as;
   s.in->suspendBuf = sr.suspendVa;
   s.in->protmSuspendBuf = sr.protm.md ? sr.protmVa : 0;
@@ -1897,6 +1906,8 @@ void fillInfo(mali_dev_info &i) {
 }  // namespace
 
 extern "C" void proc_selfname(char *buf, int size);
+extern "C" kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
+extern "C" void thread_deallocate(thread_t thread);
 
 IOReturn MaliService::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
   if (!handler) return kIOReturnBadArgument;
@@ -2008,6 +2019,8 @@ IOReturn MaliClient::gopCall(const mali_gop_in &in, union mali_gop_out *out, uin
   }
 }
 
+namespace { void gpuStallScan(); }
+
 IOReturn MaliClient::fenceWait(const mali_fence_wait_in &i, mali_fence_wait_out *o) {
   volatile uint64_t *done = nullptr;
   IOLockLock(gLock);
@@ -2025,6 +2038,7 @@ IOReturn MaliClient::fenceWait(const mali_fence_wait_in &i, mali_fence_wait_out 
   if (!o->signaled) {
     IOLockLock(gLock);
     gpuFaultScan("a fence wait ran out");
+    gpuStallScan();
     IOLockUnlock(gLock);
   }
   return kIOReturnSuccess;
@@ -2045,79 +2059,137 @@ inline uint64_t cntvct() {
   return v;
 }
 
-// A group in a slot with jobs that do not finish: the user side polls the syncobj without telling us, so the driver looks for itself, at most once a
-// second, on any call. Says where the group stands (slot, address space, per queue: jobs done / given, ring extract / insert, what the firmware reports).
+// What a stuck group is doing: slot, address space, per queue jobs done / given, ring extract / insert, and where the firmware says its stream stands
+// (command pointer, what it is blocked on; the firmware writes that only when asked: CSG_REQ_STATUS_UPDATE).
+const char *const kBlockedReason[] = {"unblocked", "scoreboard wait", "progress wait", "sync wait", "deferred", "resource", "flush"};
+
+void stallReport(unsigned slot, Group *g, const char *why, unsigned long long ms) {
+  SlotView s;
+  if (!slotView(slot, s)) return;
+  const MaliClient *owner = static_cast<const MaliClient *>(g->owner);
+  printf("mali: STALL %s's group %u in slot %u (AS%u), %s %llu ms: csg req %#x ack %#x\n", owner ? owner->name() : "the kernel", g->id, slot, g->ctx ? g->ctx->as : 0u, why, ms,
+         s.in->req, s.out->ack);
+  const uint32_t bit = 1u << 5;   // CSG_STATUS_UPDATE
+  s.in->req = (s.in->req & ~bit) | ((~s.out->ack) & bit);
+  ringGlobalDoorbell(slot);
+  const bool updated = waitUs(100000, [&s, bit] { return (s.out->ack & bit) == (s.in->req & bit); });
+  printf("mali: STALL   status update %s; group state %#x, endpoints %#x of %#x wanted\n", updated ? "answered" : "NOT answered", s.out->statusState,
+         s.out->statusEndpointCurrent, s.out->statusEndpointReq);
+  for (unsigned q = 0; q < g->queues; ++q) {
+    CsView c;
+    if (!csView(s, q, c)) continue;
+    const volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[slot].iface[q].kva);
+    const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
+    const uint32_t reason = c.out->statusBlockedReason & 0xf;
+    printf("mali: STALL   queue %u: jobs %llu of %llu, ring extract %#llx insert %#llx active %u; at %#llx, %s (wait %#x: sync %#llx for %#x%08x, scoreboards %#x, "
+           "resource %#x); cs req %#x ack %#x, fault %#x fatal %#x\n",
+           q, static_cast<unsigned long long>(*reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16)), static_cast<unsigned long long>(g->q[q].seqno),
+           static_cast<unsigned long long>(ro->extract), static_cast<unsigned long long>(ri->insert), ro->active, static_cast<unsigned long long>(c.out->statusCmdPtr),
+           reason < sizeof kBlockedReason / sizeof kBlockedReason[0] ? kBlockedReason[reason] : "?", c.out->statusWait,
+           static_cast<unsigned long long>(c.out->statusWaitSyncPtr), c.out->statusWaitSyncValueHi, c.out->statusWaitSyncValue, c.out->statusScoreboards,
+           c.out->statusReqResource, c.in->req, c.out->ack, c.out->fault, c.out->fatal);
+    const volatile uint32_t *o = reinterpret_cast<const volatile uint32_t *>(c.out);
+    const volatile uint32_t *i = reinterpret_cast<const volatile uint32_t *>(c.in);
+    if (o[0xc0 / 4] || o[0xc4 / 4] || o[0xd0 / 4] || i[0x20 / 4])
+      printf("mali: STALL   queue %u heap: in start %#x%08x end %#x%08x, out vt %#x..%#x frag end %#x address %#x%08x\n", q, i[0x24 / 4], i[0x20 / 4], i[0x2c / 4],
+             i[0x28 / 4], o[0xc0 / 4], o[0xc4 / 4], o[0xcc / 4], o[0xd4 / 4], o[0xd0 / 4]);
+    const Queue &qu = g->q[q];
+    if (qu.ring.kva && qu.ringSize) {
+      const uint64_t at = (ro->extract & ~7ull) % qu.ringSize;
+      const volatile uint64_t *w = reinterpret_cast<const volatile uint64_t *>(qu.ring.kva);
+      printf("mali: STALL   queue %u ring at %#llx: %016llx %016llx %016llx %016llx | %016llx %016llx %016llx %016llx\n", q, static_cast<unsigned long long>(at),
+             static_cast<unsigned long long>(w[((at - 32) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at - 24) % qu.ringSize) / 8]),
+             static_cast<unsigned long long>(w[((at - 16) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at - 8) % qu.ringSize) / 8]),
+             static_cast<unsigned long long>(w[at / 8]), static_cast<unsigned long long>(w[((at + 8) % qu.ringSize) / 8]),
+             static_cast<unsigned long long>(w[((at + 16) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at + 24) % qu.ringSize) / 8]));
+    }
+  }
+  printf("mali: STALL   global: req %#x ack %#x doorbell req %#x ack %#x halt %#x; GPU fault %#x at %#x%08x; mmu AS%u fault status %#x status %#x; job irq raw %#x, mcu %u\n",
+         gGlbInput->req, gGlbOutput->ack, gGlbInput->doorbellReq, gGlbOutput->doorbellAck, gGlbOutput->haltStatus, gpu(kGpuFaultStatus), gpu(kGpuFaultAddr + 4),
+         gpu(kGpuFaultAddr), g->ctx ? g->ctx->as : 0u, g->ctx ? gpu(asReg(g->ctx->as, kAsFaultStatus)) : 0u, g->ctx ? gpu(asReg(g->ctx->as, kAsStatus)) : 0u,
+         gpu(kJobIntRaw), gpu(kMcuStatus));
+}
+
+// Take a stuck group off the GPU (Panthor's job timeout): terminating its slot frees what it held, and the groups queued behind it go on. Its jobs in
+// flight count as done (whoever waits for them is let go), and from now on its submits fail: Mesa then asks GROUP_GET_STATE and makes a new context.
+void groupTimeout(Group &g) {
+  uint32_t stuck = 0;
+  for (unsigned q = 0; q < g.queues; ++q)
+    if (*reinterpret_cast<volatile uint64_t *>(g.sync.kva + q * 16) < g.q[q].seqno) stuck |= 1u << q;
+  groupStop(g);
+  for (unsigned q = 0; q < g.queues; ++q) {
+    volatile uint64_t *sync = reinterpret_cast<volatile uint64_t *>(g.sync.kva + q * 16);
+    if (sync[0] < g.q[q].seqno) { sync[1] = 1; sync[0] = g.q[q].seqno; }   // { seqno, status }: an error status, the number reached
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+  g.lost = true;
+  g.lostQueues = stuck;
+  const MaliClient *owner = static_cast<const MaliClient *>(g.owner);
+  printf("mali: HANG: %s's group %u taken off the GPU (queues %#x stuck); its context is lost, the others go on\n", owner ? owner->name() : "the kernel", g.id, stuck);
+}
+
+// Twice a second (on any call, and from the watchdog's thread: the clients wait for their syncobjs without calling us): a group in a slot with jobs that have not moved for a while. The user side polls the syncobjs without telling
+// us, so the driver looks for itself. Reports a stall after 2 s; the watchdog (boot-arg mali-hang-ms, default 3000, 0: off) takes the group that has
+// been stuck the longest off the GPU: the others are usually only queued behind it (one stuck Kodi frame held the window server's for 165 s).
 void gpuStallScan() {
-  static uint64_t last, since[kMaxGroupObjs], reported[kMaxGroupObjs];
-  static unsigned shown;
-  if (shown >= 60) return;
+  static uint64_t last, reported[kMaxGroupObjs];
+  static unsigned shown, hangMs = ~0u;
+  if (hangMs == ~0u) { hangMs = 3000; PE_parse_boot_argn("mali-hang-ms", &hangMs, sizeof hangMs); }
   if (!gCallStatFreq) __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(gCallStatFreq));
   const uint64_t now = cntvct();
-  if (last && now - last < gCallStatFreq) return;
+  if (last && now - last < gCallStatFreq / 2) return;
   last = now;
+  Group *worst = nullptr;
+  unsigned worstSlot = 0;
   for (unsigned slot = 0; slot < kMaxGroups; ++slot) {
     Group *g = gSlotGroup[slot];
     if (!g || g->id == 0 || g->id > kMaxGroupObjs) continue;
     const unsigned idx = g->id - 1;
     bool pending = false;
+    uint64_t done = 0;
     for (unsigned q = 0; q < g->queues; ++q) {
-      const volatile uint64_t *done = reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16);
-      if (*done < g->q[q].seqno) pending = true;
+      const uint64_t d = *reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16);
+      done += d;
+      if (d < g->q[q].seqno) pending = true;
     }
-    if (!pending) { since[idx] = 0; reported[idx] = 0; continue; }
-    if (!since[idx]) { since[idx] = now; continue; }
-    if (now - since[idx] < 2 * gCallStatFreq || (reported[idx] && now - reported[idx] < 4 * gCallStatFreq)) continue;
-    reported[idx] = now;
-    SlotView s;
-    if (!slotView(slot, s)) continue;
-    printf("mali: STALL group %u in slot %u (AS%u) for %llu s: csg req %#x ack %#x state %#x endpoint %#x/%#x\n", g->id, slot, g->ctx ? g->ctx->as : 0u,
-           static_cast<unsigned long long>((now - since[idx]) / gCallStatFreq), s.in->req, s.out->ack, s.out->statusState, s.out->statusEndpointCurrent, s.out->statusEndpointReq);
-    ++shown;
-    {
-      // the firmware writes the streams' status (command pointer, what they wait for) only when asked: Panthor's CSG_REQ_STATUS_UPDATE
-      const uint32_t bit = 1u << 3;
-      s.in->req = (s.in->req & ~bit) | ((~s.out->ack) & bit);
-      ringGlobalDoorbell(slot);
-      const bool updated = waitUs(20000, [&s, bit] { return (s.out->ack & bit) == (s.in->req & bit); });
-      printf("mali: STALL   status update %s (csg req %#x ack %#x)\n", updated ? "answered" : "NOT answered", s.in->req, s.out->ack);
+    if (!pending || done != g->progressDone || !g->progressAt) { g->progressDone = done; g->progressAt = now; reported[idx] = 0; continue; }
+    const uint64_t ms = (now - g->progressAt) * 1000 / gCallStatFreq;
+    if (ms >= 2000 && shown < 40 && (!reported[idx] || now - reported[idx] >= 10 * gCallStatFreq)) {
+      reported[idx] = now;
+      ++shown;
+      stallReport(slot, g, "no job done for", static_cast<unsigned long long>(ms));
     }
-    for (unsigned q = 0; q < g->queues; ++q) {
-      CsView c;
-      if (!csView(s, q, c)) continue;
-      printf("mali: STALL   queue %u waits on %#llx for %#x%08x (scoreboards %#x, resource %#x)\n", q,
-             static_cast<unsigned long long>(c.out->statusWaitSyncPtr), c.out->statusWaitSyncValueHi, c.out->statusWaitSyncValue,
-             c.out->statusScoreboards, c.out->statusReqResource);
-      {
-        const volatile uint32_t *o = reinterpret_cast<const volatile uint32_t *>(c.out);
-        const volatile uint32_t *i = reinterpret_cast<const volatile uint32_t *>(c.in);
-        printf("mali: STALL   queue %u heap: in start %#x%08x end %#x%08x, out vt %#x..%#x frag end %#x address %#x%08x; fault info %#x%08x fatal info %#x%08x\n", q,
-               i[0x24 / 4], i[0x20 / 4], i[0x2c / 4], i[0x28 / 4], o[0xc0 / 4], o[0xc4 / 4], o[0xcc / 4], o[0xd4 / 4], o[0xd0 / 4],
-               o[0x8c / 4], o[0x88 / 4], o[0x94 / 4], o[0x90 / 4]);
-        const Queue &qu = g->q[q];
-        const volatile RingOutput *rout = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
-        if (qu.ring.kva && qu.ringSize) {
-          const uint64_t at = (rout->extract & ~7ull) % qu.ringSize;
-          const volatile uint64_t *w = reinterpret_cast<const volatile uint64_t *>(qu.ring.kva);
-          printf("mali: STALL   queue %u ring at %#llx: %016llx %016llx %016llx %016llx | %016llx %016llx %016llx %016llx\n", q,
-                 static_cast<unsigned long long>(at), static_cast<unsigned long long>(w[((at - 32) % qu.ringSize) / 8]),
-                 static_cast<unsigned long long>(w[((at - 24) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at - 16) % qu.ringSize) / 8]),
-                 static_cast<unsigned long long>(w[((at - 8) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[at / 8]),
-                 static_cast<unsigned long long>(w[((at + 8) % qu.ringSize) / 8]), static_cast<unsigned long long>(w[((at + 16) % qu.ringSize) / 8]),
-                 static_cast<unsigned long long>(w[((at + 24) % qu.ringSize) / 8]));
-        }
-      }
-      const volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[slot].iface[q].kva);
-      const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
-      printf("mali: STALL   queue %u: jobs %llu of %llu, ring extract %#llx insert %#llx active %u, cs req %#x ack %#x, cmd %#llx blocked %u wait %#x, fault %#x fatal %#x\n", q,
-             static_cast<unsigned long long>(*reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16)), static_cast<unsigned long long>(g->q[q].seqno),
-             static_cast<unsigned long long>(ro->extract), static_cast<unsigned long long>(ri->insert), ro->active, c.in->req, c.out->ack,
-             static_cast<unsigned long long>(c.out->statusCmdPtr), c.out->statusBlockedReason, c.out->statusWait, c.out->fault, c.out->fatal);
+    // the one to take off: an application's group before the window server's (whose loss blanks the screen), then the one stuck longest
+    if (hangMs && ms >= hangMs && (!worst || (worst->display && !g->display) || (worst->display == g->display && g->progressAt < worst->progressAt))) {
+      worst = g;
+      worstSlot = slot;
     }
-    printf("mali: STALL   global: req %#x ack %#x doorbell req %#x ack %#x halt %#x; csg doorbell req %#x ack %#x irq req %#x ack %#x; GPU fault %#x at %#x%08x, AS0 fault %#x\n",
-           gGlbInput->req, gGlbOutput->ack, gGlbInput->doorbellReq, gGlbOutput->doorbellAck, gGlbOutput->haltStatus, s.in->doorbellReq, s.out->doorbellAck,
-           s.out->csIrqReq, s.in->csIrqAck, gpu(kGpuFaultStatus), gpu(kGpuFaultAddr + 4), gpu(kGpuFaultAddr), gpu(asReg(0, kAsFaultStatus)));
-    printf("mali: STALL   mmu AS%u: fault status %#x, status %#x; job irq raw %#x, mcu %u\n", g->ctx ? g->ctx->as : 0u, g->ctx ? gpu(asReg(g->ctx->as, kAsFaultStatus)) : 0u,
-           g->ctx ? gpu(asReg(g->ctx->as, kAsStatus)) : 0u, gpu(kJobIntRaw), gpu(kMcuStatus));
+  }
+  if (!worst) return;
+  if (!reported[worst->id - 1] || shown >= 40) stallReport(worstSlot, worst, "hung: no job done for", static_cast<unsigned long long>((now - worst->progressAt) * 1000 / gCallStatFreq));
+  groupTimeout(*worst);
+  // the rest start counting again: they were most likely waiting behind it
+  for (unsigned slot = 0; slot < kMaxGroups; ++slot)
+    if (gSlotGroup[slot]) gSlotGroup[slot]->progressAt = now;
+}
+
+// The watchdog's own thread: while every client only polls its syncobjs nobody calls the driver, and a stuck GPU would stay stuck.
+void gpuWatchdog(void *, wait_result_t) {
+  for (;;) {
+    IOSleep(500);
+    IOLockLock(gLock);
+    gpuStallScan();
+    IOLockUnlock(gLock);
+  }
+}
+void gpuWatchdogStart() {
+  unsigned hangMs = 3000;
+  PE_parse_boot_argn("mali-hang-ms", &hangMs, sizeof hangMs);
+  thread_t t;
+  if (!hangMs) return;
+  if (kernel_thread_start(gpuWatchdog, nullptr, &t) == KERN_SUCCESS) {
+    thread_deallocate(t);
+    printf("mali: GPU watchdog: a group with no job done for %u ms is taken off the GPU\n", hangMs);
   }
 }
 
@@ -2322,6 +2394,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       p.maxCompute = i.max_compute_cores; p.maxFragment = i.max_fragment_cores; p.maxTiler = i.max_tiler_cores; p.priority = i.group_priority;
       Group *g = groupCreate(*c, p, this, false);   // it gets a slot when it first has work
       if (!g) return kIOReturnNoResources;
+      g->display = gopAllowed();
       mali_group_create_out o = {g->id, 0};
       PUT_OUT(mali_group_create_out, o);
       return kIOReturnSuccess;
@@ -2360,12 +2433,21 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       NEED_IN(mali_group_submit_in, i);
       Group *g = groupFor(i.group);
       if (!g || i.queue >= g->queues || !i.cs_size || (i.cs_size & 7) || (i.cs_va & 63) || i.cs_va >= g->ctx->userVaRange) return kIOReturnBadArgument;
+      if (g->lost) return kIOReturnAborted;
       mali_group_submit_out o = {0};
       const int act = groupActivate(*g);
       if (act > 0) return kIOReturnNotReady;   // every slot has a busy group in it: externalMethod waits and calls again
       if (act < 0) return kIOReturnNoResources;
       if (!groupSubmit(*g, i.queue, i.cs_va, i.cs_size, i.latest_flush, &o.seqno)) return kIOReturnNoSpace;
       PUT_OUT(mali_group_submit_out, o);
+      return kIOReturnSuccess;
+    }
+    case MALI_GROUP_STATE: {
+      NEED_IN(mali_group_destroy_in, i);
+      Group *g = groupFor(i.group);
+      if (!g) return kIOReturnBadArgument;
+      mali_group_state_out o = {g->lost ? static_cast<uint32_t>(MALI_GROUP_STATE_TIMEDOUT) : 0u, g->lost ? g->lostQueues : 0u};
+      PUT_OUT(mali_group_state_out, o);
       return kIOReturnSuccess;
     }
     default:
@@ -2635,6 +2717,7 @@ void serviceRegister() {
   gService->setProperty("NativeSandboxGrantProcess", grant);
   gService->registerService();
   printf("mali: service \"%s\" registered: userland can open it (IOServiceGetMatchingService); sandbox grant: %s\n", MALI_SERVICE, grant);
+  gpuWatchdogStart();
   unsigned metal = 0;
   PE_parse_boot_argn("mali-metal", &metal, sizeof metal);
   if (metal) publishAccelerator();

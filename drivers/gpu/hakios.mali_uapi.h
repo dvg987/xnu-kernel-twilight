@@ -39,6 +39,7 @@ enum mali_selector {
   MALI_BO_CREATE_HOST,    // in: mali_bo_create_host_in, out: mali_bo_create_out (a buffer object over the caller's own pages)
   MALI_LOG,               // in: mali_log_in (a line for the kernel's console: the Metal plugin cannot reach a console from a sandboxed process)
   MALI_GOP,               // in: mali_gop_in, out: mali_gop_out (the display driver's GPU hand-off: mode, wait for a finished frame, complete it)
+  MALI_GROUP_STATE,       // in: mali_group_destroy_in (the group), out: mali_group_state_out (Panthor's GROUP_GET_STATE)
   MALI_SELECTOR_COUNT
 };
 
@@ -97,6 +98,11 @@ struct mali_group_create_in {
 };
 struct mali_group_create_out { uint32_t group, csg_slot; };
 struct mali_group_destroy_in { uint32_t group, pad; };
+// A group whose jobs stopped making progress (boot-arg mali-hang-ms, default 3000; 0: never) is taken off the GPU: what it had in flight counts as
+// done, later submits fail with kIOReturnAborted and its state says MALI_GROUP_STATE_TIMEDOUT (DRM_PANTHOR_GROUP_STATE_TIMEDOUT), so that the
+// client makes itself a new one. fatal_queues: the queues that were stuck.
+enum { MALI_GROUP_STATE_TIMEDOUT = 1u << 0 };
+struct mali_group_state_out { uint32_t state, fatal_queues; };
 
 struct mali_group_submit_in { uint32_t group, queue; uint64_t cs_va; uint32_t cs_size, latest_flush; };
 struct mali_group_submit_out { uint64_t seqno; };   // the job's number on that queue, counted from 1
