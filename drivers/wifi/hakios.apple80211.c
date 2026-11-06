@@ -465,9 +465,8 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	if (request->req_len != sizeof(*asked)) {
 		return EINVAL;
 	}
-	if (!hakios_sta_present()) {
-		return EBUSY;                   /* (the radio is still being brought up: the framework tries again) */
-	}
+	/* (a radio still being brought up takes the scan all the same: the station runs it once it is there. Refused,
+	 * wifid counts its boot-time auto-join as failed and does not look again for a long while) */
 	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
 	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, sizeof(*asked))) != 0) {

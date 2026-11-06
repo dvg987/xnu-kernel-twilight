@@ -1033,8 +1033,19 @@ sta_leave(void)
 	return 0;
 }
 
+/*
+ * Which access point of a network to join: the one heard best, with 5 GHz counted 20 dB better than it is. On 2.4 GHz
+ * the radio shares its antenna with the Bluetooth of the same chip (the remote), and authentications there time out
+ * (status 16) while 5 GHz ones go through; Apple's own devices prefer 5 GHz as well.
+ */
 static int
-sta_join(const struct hakios_sta_join *what)
+band_score(const struct hakios_sta_bss *b)
+{
+	return b->rssi + (b->frequency > 4000 ? 20 : 0);
+}
+
+static int
+sta_join_once(const struct hakios_sta_join *what, uint8_t (*avoid)[6], unsigned avoid_count, bool rescan)
 {
 	uint8_t req[64 + 22], r[1], open[2];
 	const struct hakios_sta_bss *t = NULL;
@@ -1052,7 +1063,7 @@ sta_join(const struct hakios_sta_join *what)
 		sta_leave();
 	}
 	/* the access point of that name heard best (or the one asked for); not heard yet: a scan for it first */
-	for (int round = 0; round < 2 && t == NULL; round++) {
+	for (int round = rescan ? 1 : 0; round < 2 && t == NULL; round++) {
 		if (round == 1) {
 			struct hakios_sta_scan named;
 
@@ -1065,8 +1076,13 @@ sta_join(const struct hakios_sta_join *what)
 		for (unsigned i = 0; i < w.bss_count; i++) {
 			const struct hakios_sta_bss *b = &w.bss[i];
 
-			if (b->ssid_length == what->ssid_length && memcmp(b->ssid, what->ssid, what->ssid_length) == 0 &&
-			    (any_bssid ? t == NULL || b->rssi > t->rssi : memcmp(b->bssid, what->bssid, 6) == 0)) {
+			bool avoided = false;
+
+			for (unsigned k = 0; k < avoid_count; k++) {
+				avoided |= memcmp(b->bssid, avoid[k], 6) == 0;
+			}
+			if (b->ssid_length == what->ssid_length && memcmp(b->ssid, what->ssid, what->ssid_length) == 0 && !avoided &&
+			    (any_bssid ? t == NULL || band_score(b) > band_score(t) : memcmp(b->bssid, what->bssid, 6) == 0)) {
 				t = b;
 			}
 		}
@@ -1079,6 +1095,9 @@ sta_join(const struct hakios_sta_join *what)
 		printf("w2: join: that network has not been heard\n");
 		return ENOENT;
 	}
+
+	printf("w2: join: access point ..:%02x:%02x:%02x, %u MHz, %d dBm%s\n", w.target.bssid[3], w.target.bssid[4], w.target.bssid[5],
+	    w.target.frequency, w.target.rssi, avoid_count ? " (another of that network)" : "");
 
 	/* the handshake's part, ready before the access point begins it */
 	bzero(&w.wpa, sizeof(w.wpa));
@@ -1171,6 +1190,41 @@ out:
 		send_msg(SM_DISCONNECT_REQ, d, sizeof(d), CFM(SM_DISCONNECT_REQ), NULL, 0);
 	}
 	w.phase = HAKIOS_STA_IDLE;
+	return error;
+}
+
+/*
+ * A join that the access point did not take up (802.11 status 16: no answer to our authentication; or no answer at all)
+ * is tried again, twice: after a pause (the firmware may still be leaving the network wifid left a moment before), with
+ * a fresh scan for that name, and with another access point of the same network when it has more than one (a band or a
+ * mesh node heard well in an old scan may not hear us).
+ */
+static int
+sta_join(const struct hakios_sta_join *what)
+{
+	uint8_t avoid[2][6];
+	unsigned avoided = 0;
+	int error = sta_join_once(what, avoid, 0, false);
+
+	for (unsigned attempt = 1; attempt <= 2 && (error == ECONNREFUSED || error == ETIMEDOUT); attempt++) {
+		uint8_t tried[6];
+		bool any_bssid = true;
+
+		memcpy(tried, w.target.bssid, 6);
+		for (int i = 0; i < 6; i++) {
+			any_bssid &= what->bssid[i] == 0;
+		}
+		if (any_bssid && avoided < 2) {
+			memcpy(avoid[avoided++], tried, 6);
+		}
+		printf("w2: join: attempt %u of 3 after status %u\n", attempt + 1, w.connect_status);
+		IOSleep(500);
+		error = sta_join_once(what, avoid, avoided, true);
+		if (error == ENOENT && avoided != 0) {             /* no other access point of that name: the same one again */
+			avoided = 0;
+			error = sta_join_once(what, avoid, 0, false);
+		}
+	}
 	return error;
 }
 

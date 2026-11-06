@@ -17,6 +17,7 @@
  * another network -- as Darwin itself rejoins the networks it knows. If that other network cannot
  * be joined (a wrong passphrase), the standing one is joined again.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
@@ -48,6 +49,26 @@ static struct hakios_sta_scan asked_scan_what;
 static struct hakios_sta_join asked_join_what;
 static struct hakios_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
 static struct hakios_sta_join fallback;        /* ... as it was before a join that has not come through yet */
+/*
+ * The network of fw/network, kept whatever wifid asks for: when the link has been down for a while and nobody has
+ * asked for a network, it is joined again. wifid leaves the network when tvOS goes to sleep (this radio has no
+ * wake-on-wireless for it) and does not join again by itself on this port; without this the box falls off the
+ * network for good after 15 minutes of nobody using it. If wifid leaves again soon after such a join, the wait
+ * before the next one doubles (up to 10 minutes): the two take turns rather than fight.
+ */
+static struct hakios_sta_join configured;
+static bool sta_link;                           /* joined, as far as the events say */
+static unsigned rejoin_wait = 15;               /* seconds */
+static uint64_t rejoined_at;                    /* (nanoseconds since boot) */
+
+static uint64_t
+sta_now_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
 
 static struct hakios_sta_bss *heard;           /* by the last scan that came to an end */
 static unsigned heard_count;
@@ -78,7 +99,21 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 
 		lck_mtx_lock(&sta_lock);
 		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
-			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
+			if (sta_ops != NULL && sta_on && !sta_link && configured.ssid_length != 0) {
+				uint64_t deadline;
+
+				nanoseconds_to_absolutetime((uint64_t)rejoin_wait * NSEC_PER_SEC, &deadline);
+				deadline += mach_absolute_time();
+				if (lck_mtx_sleep_deadline(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT, deadline) ==
+				    THREAD_TIMED_OUT && sta_on && !sta_link && !(asked_power || asked_leave || asked_join || asked_scan)) {
+					printf("sta: no network for %u s and nobody asked for one: the configured one again\n", rejoin_wait);
+					asked_join_what = configured;
+					asked_join = true;
+					rejoined_at = sta_now_ns();
+				}
+			} else {
+				lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
+			}
 		}
 		ops = sta_ops;
 		/* one thing at a time, in the order that makes sense when several wait */
@@ -115,6 +150,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			if (!power_on && was_joined) {
 				hakios_apple80211_event(HAKIOS_STA_LINK, 0);
 			}
+			sta_link = sta_link && power_on;
 			hakios_apple80211_event(HAKIOS_STA_POWER, error == 0 ? power_on : !power_on);
 			lck_mtx_lock(&sta_lock);
 			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
@@ -124,6 +160,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			lck_mtx_unlock(&sta_lock);
 		} else if (leave) {
 			ops->leave();
+			sta_link = false;
 			hakios_apple80211_event(HAKIOS_STA_LINK, 0);
 		} else if (do_join) {
 			error = ops->join(&join);
@@ -132,6 +169,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			if (error == 0) {
 				hakios_apple80211_event(HAKIOS_STA_LINK, 1);
 			}
+			sta_link = error == 0;
 			/* a join that did not come through (a wrong passphrase) leaves things as they were: the standing network again */
 			lck_mtx_lock(&sta_lock);
 			if (error != 0 && fallback.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
@@ -202,6 +240,8 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 void
 hakios_sta_lost(int error)
 {
+	sta_link = false;
+	thread_wakeup((event_t)&sta_ops);
 	hakios_apple80211_event(HAKIOS_STA_LINK, error != 0 ? error : ECONNRESET);
 }
 
@@ -253,9 +293,10 @@ int
 hakios_sta_ask_scan(const struct hakios_sta_scan *what)
 {
 	lck_mtx_lock(&sta_lock);
-	if (sta_ops == NULL || !sta_on) {
+	/* a scan asked for before the radio is there (wifid's first, at boot) waits for it: the thread runs it then */
+	if (sta_ops != NULL && !sta_on) {
 		lck_mtx_unlock(&sta_lock);
-		return sta_ops == NULL ? ENXIO : ENETDOWN;
+		return ENETDOWN;
 	}
 	asked_scan_what = *what;
 	asked_scan = true;
@@ -272,6 +313,7 @@ hakios_sta_ask_join_standing(const struct hakios_sta_join *what)
 	lck_mtx_lock(&sta_lock);
 	if (error == 0) {
 		standing = *what;
+		configured = *what;
 	}
 	lck_mtx_unlock(&sta_lock);
 	return error;
@@ -281,9 +323,10 @@ int
 hakios_sta_ask_join(const struct hakios_sta_join *what)
 {
 	lck_mtx_lock(&sta_lock);
-	if (sta_ops == NULL || !sta_on) {
+	/* (as a scan: a join asked for before the radio is there waits for it) */
+	if (sta_ops != NULL && !sta_on) {
 		lck_mtx_unlock(&sta_lock);
-		return sta_ops == NULL ? ENXIO : ENETDOWN;
+		return ENETDOWN;
 	}
 	if (standing.ssid_length != 0) {
 		fallback = standing;
@@ -305,6 +348,13 @@ hakios_sta_ask_leave(void)
 		lck_mtx_unlock(&sta_lock);
 		return ENXIO;
 	}
+	if (rejoined_at != 0 && sta_now_ns() - rejoined_at < 120 * NSEC_PER_SEC) {
+		rejoin_wait = rejoin_wait * 2 > 600 ? 600 : rejoin_wait * 2;
+		printf("sta: left soon after the configured network was joined again: the next try in %u s\n", rejoin_wait);
+	} else {
+		rejoin_wait = 15;
+	}
+	rejoined_at = 0;
 	asked_leave = true;
 	asked_join = false;
 	bzero(&asked_join_what, sizeof(asked_join_what));
