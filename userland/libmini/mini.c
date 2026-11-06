@@ -263,6 +263,13 @@ fsync(int fd)
 	return (int)SC(SYS_fsync, fd, 0, 0, 0, 0, 0);
 }
 
+/* every mounted filesystem's dirty data and metadata written out */
+int
+sync(void)
+{
+	return (int)SC(SYS_sync, 0, 0, 0, 0, 0, 0);
+}
+
 ssize_t
 pread(int fd, void *buf, size_t count, off_t offset)
 {

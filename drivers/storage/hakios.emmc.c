@@ -1,9 +1,11 @@
 /*
  * The eMMC of the Xiaomi Mi Box S Gen 3 (Amlogic S905X5M, SD_EMMC controller at 0xfe08c000) as block
- * devices: one for each GPT partition the boot-arg emmc= names, /dev/emmc_NAME and /dev/remmc_NAME.
+ * devices, /dev/emmc_NAME and /dev/remmc_NAME:
  *
- *   emmc=1         the partition "darwin" (the Darwin volume), read only
- *   emmc=2         the same, writable (the data volume after the Darwin one)
+ *   emmc=1         emmc_darwin: the GPT partition "darwin" (the tvOS system volume at its start), read only
+ *   emmc=2         the same, read only, and emmc_darwin_data: darwin from EMMC_DATA_FIRST to its end, writable --
+ *                  the data volume (HFS Plus, init mounts it on /private/var: var_hfs=emmc_darwin_data; made by
+ *                  tools/twl-datavol.py)
  *
  * The controller is used as U-Boot leaves it: clocked, tuned, the bus 8 bits wide and the card selected
  * (RCA 1) in its transfer state, the user area current. Nothing of that is changed; a request is one
@@ -12,7 +14,7 @@
  * chain. No interrupt.
  *
  * Only the partitions named are reachable: every request is checked against the partition's extent,
- * which comes from the GPT on the card itself.
+ * which comes from the GPT on the card itself, and only emmc_darwin_data takes writes.
  */
 
 #include <kern/clock.h>
@@ -61,6 +63,12 @@ extern uint64_t kvtophys(vm_offset_t va);
 #define EMMC_MAX_BLOCKS         (EMMC_MAX_XFER / EMMC_SECTOR)
 #define EMMC_RCA                1u
 #define EMMC_MAX_PARTS          4
+/*
+ * Where in darwin the data volume begins: 4 GiB in, past the tvOS system volume (out/tvos-system.apfs, an APFS
+ * container of 4,027,199,488 bytes, and the read-only containers that may follow it there). darwin is 10 GiB:
+ * 6 GiB of data volume.
+ */
+#define EMMC_DATA_FIRST         ((4ULL << 30) / EMMC_SECTOR)
 
 struct emmc_part {
 	char     name[36];
@@ -370,7 +378,7 @@ emmc_utf16_name(const uint8_t *u, char *out, size_t size)
 }
 
 static int
-emmc_read_gpt(bool writable)
+emmc_read_gpt(bool with_data)
 {
 	uint8_t *buf;
 	uint64_t entries_lba;
@@ -416,7 +424,16 @@ emmc_read_gpt(bool writable)
 		strlcpy(pt->name, name, sizeof(pt->name));
 		pt->first = first;
 		pt->count = last - first + 1;
-		pt->writable = writable;
+		pt->writable = false;           /* the system volume: never written from here */
+		/* emmc=2: the rest of it, the data volume, the one stretch of the card this driver writes */
+		if (with_data && pt->count > EMMC_DATA_FIRST && emmc.nparts < EMMC_MAX_PARTS) {
+			struct emmc_part *data = &emmc.part[emmc.nparts++];
+
+			strlcpy(data->name, "darwin_data", sizeof(data->name));
+			data->first = pt->first + EMMC_DATA_FIRST;
+			data->count = pt->count - EMMC_DATA_FIRST;
+			data->writable = true;
+		}
 	}
 	kfree_data(buf, EMMC_SECTOR * 32);
 	return 0;

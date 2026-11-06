@@ -18,7 +18,7 @@
  *   reach NAME            what SCNetworkReachability says: the question applications ask first
  *   wait SECONDS
  *   wifi                  what the job com.hakios.wifi runs in every image: if the kernel was
- *                         started with wifi=1, wait for the radio's interface (en0) to appear,
+ *                         started with wifi=1 (or w2=N), wait for the radio's interface (en0) to appear,
  *                         and ask for it to be configured by DHCP ("dhcp en0") only if configd
  *                         has no network service of its own for it; else nothing
  *   watch SECONDS         for so long, say when configd's store changes what tells an interface's
@@ -390,7 +390,8 @@ wifi(void)
 		return;
 	}
 	for (const char *word = strtok(arguments, " "); word != NULL; word = strtok(NULL, " ")) {
-		wanted |= strcmp(word, "wifi=1") == 0;
+		/* (w2=N: the Amlogic box's radio, which the kernel joins to its network by itself) */
+		wanted |= strcmp(word, "wifi=1") == 0 || (strncmp(word, "w2=", 3) == 0 && strcmp(word, "w2=0") != 0);
 	}
 	if (!wanted) {
 		return;

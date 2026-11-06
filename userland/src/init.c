@@ -592,7 +592,7 @@ parse_number(const char *text, int radix)
 static int
 copy_file(const char *from, const char *to, int mode, int uid, int gid)
 {
-	static char buf[4096];
+	static char buf[65536];
 	int in = open(from, O_RDONLY, 0), out, ok = 0;
 	ssize_t n;
 
@@ -920,6 +920,160 @@ empty_tree(const char *path, int depth)
 	close(fd);
 }
 
+/* The user's corner of the prefix at /private/var/jb, mobile's: 1 when all of it is. */
+static int
+prefix_mobile(void)
+{
+	int ok = 1;
+
+	/*
+	 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an
+	 * application of the prefix runs as mobile and keeps its data there (Sileo's database).
+	 */
+	static const char *const mobiles[] = { "/private/var/jb/var/mobile", "/private/var/jb/var/mobile/Library",
+		                               "/private/var/jb/var/mobile/Library/Caches",
+		                               "/private/var/jb/var/mobile/Library/Preferences",
+		                               "/private/var/jb/var/mobile/Documents",
+		                               /*
+		                                * Sileo keeps the indexes of its repositories apart from
+		                                * apt's own (it runs apt with -oDir::State::lists=
+		                                * sileolists/), and it is mobile who writes them.
+		                                */
+		                               "/private/var/jb/var/lib/apt/sileolists",
+		                               "/private/var/jb/var/lib/apt/sileolists/partial" };
+
+	for (unsigned i = 0; i < sizeof(mobiles) / sizeof(mobiles[0]); i++) {
+		mkdir(mobiles[i], 0755);
+		ok = chown(mobiles[i], 501, 501) == 0 && ok;
+	}
+	return own_tree("/private/var/jb/var/mobile", 501) && ok;
+}
+
+/* /var/jb/etc/pwd.db made from master.passwd: 1 when it was. */
+static int
+prefix_users(void)
+{
+	struct stat st;
+	int users = 0;
+
+	/*
+	 * The prefix's own user database. Its programs do not ask Darwin who a user is: they are
+	 * built against libiosexec, which carries an ie_getpwnam of its own and reads
+	 * /var/jb/etc/pwd.db -- a Berkeley database that pwd_mkdb makes from master.passwd and
+	 * that the bootstrap does not ship, only the text it is made from. Without it every
+	 * program of the prefix answers "no such user": an sshd from here refused every login
+	 * with "Invalid user root" while Darwin's own /bin/ps resolved users perfectly -- and the
+	 * asymmetry is exactly this, not anything about Darwin's own database or the launchd domain
+	 * its server sits in, because a program of the prefix never asks Darwin at all. A grafted
+	 * copy of the prefix is new at every boot, so the database is made at every boot (it takes
+	 * milliseconds); for a kept one (kept_prefix) as well, in case master.passwd was changed.
+	 */
+	if (stat("/private/var/jb/usr/sbin/pwd_mkdb", &st) == 0) {
+		char *argv[] = { "/var/jb/usr/sbin/pwd_mkdb", "-p", "/var/jb/etc/master.passwd", NULL };
+		char *envp[] = { "PATH=/var/jb/usr/sbin:/var/jb/usr/bin:/usr/bin:/bin", NULL };
+		int status = 0;
+		pid_t pid = fork();
+
+		if (pid == 0) {
+			execve(argv[0], argv, envp);
+			_exit(127);
+		}
+		if (pid > 0 && wait4(pid, &status, 0, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+			users = 1;
+		}
+	}
+	return users;
+}
+
+/* PATH gone, whatever it is: a tree, a file or a link */
+static void
+remove_path(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) != 0) {
+		return;
+	}
+	if ((st.st_mode & S_IFMT) == S_IFDIR) {
+		empty_tree(path, 0);
+		rmdir(path);
+	} else {
+		unlink(path);
+	}
+}
+
+/*
+ * The package manager's prefix kept on the data volume (var_hfs=; tvOS on the box): /private/var/jb, a real copy of
+ * the image's /jb (tools/twl-jb.sh: Procursus' bootstrap made tvOS, with OpenSSH; tvos/build.sh JB=1), made once
+ * and then left alone, so that what apt installs into it stays. The image's /jb is copied when the volume has no
+ * prefix yet or one of another version (the first line of .jb-version differs) -- in place of the old one, packages
+ * installed since and all. An image without /jb uses the prefix the volume has. The copy is made in jb.new and
+ * renamed into place whole: a boot that dies in the middle leaves the old prefix (or none), and the next boot starts
+ * the copy again. HFS Plus keeps a file's number for good and finds its path by it, which LaunchServices needs to
+ * register an application in /var/jb/Applications (the phone's ramfs did not, and nothing registered from there).
+ * 1: /private/var/jb is such a prefix, ready to use.
+ */
+static int
+kept_prefix(void)
+{
+	static char from[256], want[128], have[128];
+	static const char *const jb = "/private/var/jb", *const fresh = "/private/var/jb.new", *const old = "/private/var/jb.old";
+	struct stat st;
+	int files = 0, ok, moved = 0;
+
+	strcpy(from, in_image("/jb"));
+	want[0] = have[0] = 0;
+	read_whole(join(from, "/.jb-version", ""), want, sizeof(want));
+	read_whole(join(jb, "/.jb-version", ""), have, sizeof(have));
+	for (char *p = want; *p; p++) {         /* the first line of each */
+		*p = *p == '\n' ? 0 : *p;
+	}
+	for (char *p = have; *p; p++) {
+		*p = *p == '\n' ? 0 : *p;
+	}
+	if (want[0] == 0 || strcmp(want, have) == 0) {
+		if (have[0] != 0) {
+			/* (pwd.db again: master.passwd may have been changed since, and it takes milliseconds) */
+			printf("  /var/jb: the prefix on the data volume (%s)%s%s\n", have, want[0] ? ", the image's is the same" : "",
+			    prefix_users() ? ", users resolvable" : "");
+		}
+		return have[0] != 0;
+	}
+	printf("  /var/jb: the image's prefix (%s) onto the data volume, in place of %s\n", want, have[0] ? have : "none");
+	remove_path(fresh);
+	remove_path(old);
+	ok = copy_tree(from, fresh, &files);
+	/* all of it on the card before the name that says it is there: a run that ends without unmounting (the box
+	 * returning to fastboot) must not leave a prefix of the right version made of files whose data never arrived */
+	sync();
+	if (ok && lstat(jb, &st) == 0) {
+		if ((st.st_mode & S_IFMT) == S_IFDIR) {
+			ok = moved = rename(jb, old) == 0;
+		} else {
+			ok = unlink(jb) == 0;
+		}
+	}
+	ok = ok && rename(fresh, jb) == 0;
+	if (!ok) {
+		printf("  /var/jb: %s\n", strerror(errno));
+		if (moved) {
+			rename(old, jb);
+		}
+	}
+	remove_path(fresh);
+	remove_path(old);
+	if (ok) {
+		int users;
+
+		ok = prefix_mobile();
+		users = prefix_users();
+		sync();
+		printf("  /var/jb: %d files and links copied%s\n", files, users ? ", users resolvable" : "");
+	}
+	check(ok, "copy the package manager's prefix onto the data volume");
+	return ok || have[0] != 0;
+}
+
 static void
 mount_writable(void)
 {
@@ -1004,7 +1158,8 @@ mount_writable(void)
 	 * -- the boot volume, where a rootless jailbreak on an iPhone keeps its Procursus too
 	 * (/var/jb leads into /private/preboot there)
 	 */
-	jb = stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/jb" :
+	jb = ok && var_kept && kept_prefix() ? NULL :         /* (one copied onto the data volume once: not grafted) */
+	    stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/jb" :
 	    stat("/private/preboot/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/private/preboot/jb" : NULL;
 	if (ok && jb != NULL) {
 		const char *to = "/private/var/jb";
@@ -1036,53 +1191,8 @@ mount_writable(void)
 		}
 		grafted = graft_tree(jb, to, 1, &dirs, &entries);
 
-		/*
-		 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an
-		 * application of the prefix runs as mobile and keeps its data there (Sileo's database).
-		 */
-		static const char *const mobiles[] = { "/private/var/jb/var/mobile", "/private/var/jb/var/mobile/Library",
-			                               "/private/var/jb/var/mobile/Library/Caches",
-			                               "/private/var/jb/var/mobile/Library/Preferences",
-			                               "/private/var/jb/var/mobile/Documents",
-			                               /*
-			                                * Sileo keeps the indexes of its repositories apart from
-			                                * apt's own (it runs apt with -oDir::State::lists=
-			                                * sileolists/), and it is mobile who writes them.
-			                                */
-			                               "/private/var/jb/var/lib/apt/sileolists",
-			                               "/private/var/jb/var/lib/apt/sileolists/partial" };
-
-		for (unsigned i = 0; i < sizeof(mobiles) / sizeof(mobiles[0]); i++) {
-			mkdir(mobiles[i], 0755);
-			grafted = chown(mobiles[i], 501, 501) == 0 && grafted;
-		}
-		grafted = own_tree("/private/var/jb/var/mobile", 501) && grafted;
-		/*
-		 * The prefix's own user database. Its programs do not ask Darwin who a user is: they are
-		 * built against libiosexec, which carries an ie_getpwnam of its own and reads
-		 * /var/jb/etc/pwd.db -- a Berkeley database that pwd_mkdb makes from master.passwd and
-		 * that the bootstrap does not ship, only the text it is made from. Without it every
-		 * program of the prefix answers "no such user": an sshd from here refused every login
-		 * with "Invalid user root" while Darwin's own /bin/ps resolved users perfectly -- and the
-		 * asymmetry is exactly this, not anything about Darwin's own database or the launchd domain
-		 * its server sits in, because a program of the prefix never asks Darwin at all. The
-		 * writable copy of the prefix is new at every boot, so the database is made at every
-		 * boot; it takes milliseconds.
-		 */
-		if (stat("/private/var/jb/usr/sbin/pwd_mkdb", &st) == 0) {
-			char *argv[] = { "/var/jb/usr/sbin/pwd_mkdb", "-p", "/var/jb/etc/master.passwd", NULL };
-			char *envp[] = { "PATH=/var/jb/usr/sbin:/var/jb/usr/bin:/usr/bin:/bin", NULL };
-			int status = 0;
-			pid_t pid = fork();
-
-			if (pid == 0) {
-				execve(argv[0], argv, envp);
-				_exit(127);
-			}
-			if (pid > 0 && wait4(pid, &status, 0, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-				users = 1;
-			}
-		}
+		grafted = prefix_mobile() && grafted;
+		users = prefix_users();
 		printf("  /var/jb from %s, in %s: %d directories, %d files and links%s\n", jb, to, dirs, entries,
 		    users ? ", users resolvable" : "");
 		check(grafted, "graft the package manager's prefix onto the data volume");
