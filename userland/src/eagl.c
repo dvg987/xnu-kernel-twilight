@@ -249,6 +249,7 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
+	bool application;               /* not the window server's: the library's functions as they are (eagl_fill_table_plain) */
 	struct image images[256];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
@@ -3987,9 +3988,16 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
-	eagl_fill_table(e->table);
+	/* the window server's CoreAnimation gets the table that bends OpenGL ES its way; an application, the library as it is */
+	e->application = strcmp(getprogname(), "backboardd") != 0;
+	if (e->application) {
+		eagl_fill_table_plain(e->table);
+	} else {
+		eagl_fill_table(e->table);
+	}
 	contexts[place] = e;
-	say("hakios-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, hakios_gl_library(),
+	say("hakios-gl: an OpenGL ES %lu context for %s, by %s: %s; %s; shaders %s\n", api,
+	    e->application ? getprogname() : "CoreAnimation", hakios_gl_library(),
 	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
 	return self;
@@ -4184,6 +4192,279 @@ my_dealloc(id self, SEL selector)
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }
 
+/*
+ * ---- an application's own layer (CAEAGLLayer: Kodi, games, UIKit's GL views) --------------------------
+ *
+ * An application draws into a renderbuffer whose storage -renderbufferStorage:fromDrawable: takes from
+ * its CAEAGLLayer, and -presentRenderbuffer: puts what it drew on the screen. Darwin's own two methods do
+ * that through GLEngine (gliAttachDrawable, gliPresentViewES), which a context of ours does not have. Here
+ * the renderbuffer gets ordinary storage of the layer's size in pixels, and a present copies it, turned
+ * over (OpenGL counts rows from the bottom, a surface from the top), into the next of three IOSurfaces
+ * that becomes the layer's contents; the window server shows it. With a library that can draw into an
+ * IOSurface's own memory (hakios_gl_surface_texture) the copy is the GPU's; else it is read back.
+ * The context current on a thread is what the gl* functions of OpenGLES.framework use: they find it in
+ * thread-local storage, slot 30 (TPIDRRO_EL0 + 0xf0), as a table whose word at 0x20 is their first
+ * argument -- ours, e->table, less 0x20.
+ */
+#ifndef GL_RENDERBUFFER
+#define GL_RENDERBUFFER                 0x8d41
+#endif
+#define GL_RENDERBUFFER_BINDING_        0x8ca7
+#define GL_RGBA8_                       0x8058
+#define GL_FRAMEBUFFER_BINDING_         0x8ca6
+#define GL_BGRA_EXT_                    0x80e1
+#define DRAWABLE_SURFACES               3
+#define OPENGL_TSD_SLOT                 30
+
+struct drawable {
+	struct eagl *e;
+	id layer;
+	GLuint renderbuffer;            /* the application's */
+	GLuint source;                  /* a framebuffer of ours with that renderbuffer as its colour */
+	GLint width, height;
+	IOSurfaceRef surfaces[DRAWABLE_SURFACES];
+	GLuint textures[DRAWABLE_SURFACES], targets[DRAWABLE_SURFACES];
+	bool shared[DRAWABLE_SURFACES];
+	unsigned next, presents;
+};
+
+static struct drawable drawables[16];
+static __thread struct eagl *thread_context;
+
+struct layer_rect {
+	double x, y, width, height;
+};
+
+static void
+drawable_release(struct drawable *d)
+{
+	for (unsigned i = 0; i < DRAWABLE_SURFACES; i++) {
+		if (d->targets[i] != 0) {
+			glDeleteFramebuffers(1, &d->targets[i]);
+		}
+		if (d->textures[i] != 0) {
+			glDeleteTextures(1, &d->textures[i]);
+		}
+		if (d->surfaces[i] != NULL) {
+			CFRelease(d->surfaces[i]);
+		}
+		d->targets[i] = d->textures[i] = 0;
+		d->surfaces[i] = NULL;
+	}
+	if (d->source != 0) {
+		glDeleteFramebuffers(1, &d->source);
+	}
+	d->source = 0;
+	d->width = d->height = 0;
+}
+
+static struct drawable *
+drawable_of(struct eagl *e, GLuint renderbuffer, bool make)
+{
+	struct drawable *free_one = NULL, *last = NULL;
+
+	for (unsigned i = 0; i < sizeof(drawables) / sizeof(drawables[0]); i++) {
+		struct drawable *d = &drawables[i];
+
+		if (d->e == e && d->renderbuffer == renderbuffer && renderbuffer != 0) {
+			return d;
+		}
+		if (d->e == e && d->renderbuffer != 0) {
+			last = d;
+		}
+		if (d->e == NULL && free_one == NULL) {
+			free_one = d;
+		}
+	}
+	if (!make) {
+		return last;                    /* (a present with another renderbuffer bound: the layer's one) */
+	}
+	if (free_one != NULL) {
+		bzero(free_one, sizeof(*free_one));
+		free_one->e = e;
+		free_one->renderbuffer = renderbuffer;
+	}
+	return free_one;
+}
+
+static IOSurfaceRef
+drawable_surface(GLint width, GLint height)
+{
+	int32_t w = width, h = height, bpe = 4, row = (width * 4 + 63) & ~63, format = 'BGRA';
+	CFNumberRef values[5] = {
+		CFNumberCreate(NULL, kCFNumberSInt32Type, &w), CFNumberCreate(NULL, kCFNumberSInt32Type, &h),
+		CFNumberCreate(NULL, kCFNumberSInt32Type, &bpe), CFNumberCreate(NULL, kCFNumberSInt32Type, &row),
+		CFNumberCreate(NULL, kCFNumberSInt32Type, &format),
+	};
+	const void *keys[5] = { CFSTR("IOSurfaceWidth"), CFSTR("IOSurfaceHeight"), CFSTR("IOSurfaceBytesPerElement"),
+		                CFSTR("IOSurfaceBytesPerRow"), CFSTR("IOSurfacePixelFormat") };
+	CFDictionaryRef properties = CFDictionaryCreate(NULL, keys, (const void **)values, 5, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surface = IOSurfaceCreate(properties);
+
+	CFRelease(properties);
+	for (unsigned i = 0; i < 5; i++) {
+		CFRelease(values[i]);
+	}
+	return surface;
+}
+
+static BOOL
+my_renderbufferStorage(id self, SEL selector, unsigned long target, id layer)
+{
+	struct eagl *e = context_of(self);
+	struct drawable *d;
+	struct layer_rect bounds;
+	double scale;
+	GLint renderbuffer = 0, framebuffer = 0, texture = 0;
+	GLenum error;
+
+	(void)selector;
+	if (e == NULL || target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	glGetIntegerv(GL_RENDERBUFFER_BINDING_, &renderbuffer);
+	if (renderbuffer == 0 || (d = drawable_of(e, (GLuint)renderbuffer, true)) == NULL) {
+		say("hakios-gl: -renderbufferStorage:fromDrawable: with no renderbuffer bound (or too many layers)\n");
+		return NO;
+	}
+	drawable_release(d);
+	d->layer = layer;
+	if (layer == nil) {
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8_, 0, 0);
+		d->e = NULL;
+		d->renderbuffer = 0;
+		return YES;
+	}
+	bounds = ((struct layer_rect (*)(id, SEL))objc_msgSend)(layer, sel_registerName("bounds"));
+	scale = ((double (*)(id, SEL))objc_msgSend)(layer, sel_registerName("contentsScale"));
+	if (!(scale > 0)) {
+		scale = 1;
+	}
+	d->width = (GLint)(bounds.width * scale + 0.5);
+	d->height = (GLint)(bounds.height * scale + 0.5);
+	if (d->width <= 0 || d->height <= 0) {
+		say("hakios-gl: -renderbufferStorage:fromDrawable: a layer of %gx%g: nothing to draw into\n", bounds.width, bounds.height);
+		return NO;
+	}
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8_, d->width, d->height);
+	if ((error = glGetError()) != 0) {
+		say("hakios-gl: -renderbufferStorage:fromDrawable: %dx%d refused (%#x)\n", d->width, d->height, error);
+		return NO;
+	}
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING_, &framebuffer);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+	glGenFramebuffers(1, &d->source);
+	glBindFramebuffer(GL_FRAMEBUFFER, d->source);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, (GLuint)renderbuffer);
+	for (unsigned i = 0; i < DRAWABLE_SURFACES; i++) {
+		d->surfaces[i] = drawable_surface(d->width, d->height);
+		glGenTextures(1, &d->textures[i]);
+		glBindTexture(GL_TEXTURE_2D, d->textures[i]);
+		d->shared[i] = d->surfaces[i] != NULL && hakios_gl_surface_texture(e->gl, IOSurfaceGetID(d->surfaces[i])) != 0;
+		if (!d->shared[i]) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, d->width, d->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		}
+		glGenFramebuffers(1, &d->targets[i]);
+		glBindFramebuffer(GL_FRAMEBUFFER, d->targets[i]);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->textures[i], 0);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+	say("hakios-gl: an application's layer: %dx%d pixels (scale %g), renderbuffer %d, %s\n", d->width, d->height, scale,
+	    renderbuffer, d->shared[0] ? "its surfaces drawn into by the GPU" : "its surfaces filled by reading back");
+	return YES;
+}
+
+static BOOL
+present(id self, unsigned long target)
+{
+	struct eagl *e = context_of(self);
+	struct drawable *d;
+	GLint renderbuffer = 0, read = 0, draw = 0;
+	unsigned i;
+	Class transaction = objc_getClass("CATransaction");
+
+	if (e == NULL || target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	glGetIntegerv(GL_RENDERBUFFER_BINDING_, &renderbuffer);
+	if ((d = drawable_of(e, (GLuint)renderbuffer, false)) == NULL || d->source == 0 || d->layer == nil) {
+		return NO;
+	}
+	i = d->next;
+	d->next = (i + 1) % DRAWABLE_SURFACES;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, d->source);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d->targets[i]);
+	glBlitFramebuffer(0, 0, d->width, d->height, 0, d->height, d->width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	if (d->shared[i]) {
+		glFinish();
+	} else if (d->surfaces[i] != NULL && IOSurfaceLock(d->surfaces[i], 0, NULL) == 0) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, d->targets[i]);
+		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(IOSurfaceGetBytesPerRow(d->surfaces[i]) / 4));
+		glReadPixels(0, 0, d->width, d->height, GL_BGRA_EXT_, GL_UNSIGNED_BYTE, IOSurfaceGetBaseAddress(d->surfaces[i]));
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		IOSurfaceUnlock(d->surfaces[i], 0, NULL);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("begin"));
+	((void (*)(id, SEL, BOOL))objc_msgSend)((id)transaction, sel_registerName("setDisableActions:"), YES);
+	((void (*)(id, SEL, id))objc_msgSend)(d->layer, sel_registerName("setContents:"), (id)d->surfaces[i]);
+	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("commit"));
+	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("flush"));
+	if (++d->presents == 1 || d->presents % 600 == 0) {
+		say("hakios-gl: an application's layer: %u frames shown (GL error %#x)\n", d->presents, glGetError());
+	}
+	return YES;
+}
+
+static BOOL
+my_presentRenderbuffer(id self, SEL selector, unsigned long target)
+{
+	(void)selector;
+	return present(self, target);
+}
+
+static BOOL
+my_presentRenderbufferAtTime(id self, SEL selector, unsigned long target, double time)
+{
+	(void)selector;
+	(void)time;
+	return present(self, target);
+}
+
+static BOOL
+my_setCurrentContext(id class, SEL selector, id context)
+{
+	void **tsd;
+	struct eagl *e = context == nil ? NULL : context_of(context);
+
+	(void)class;
+	(void)selector;
+	__asm__ volatile ("mrs %0, TPIDRRO_EL0" : "=r"(tsd));
+	if (context != nil && e == NULL) {
+		return NO;
+	}
+	if (!hakios_gl_make_current(e != NULL ? e->gl : NULL) && e != NULL) {
+		return NO;
+	}
+	thread_context = e;
+	current = e;
+	tsd[OPENGL_TSD_SLOT] = e != NULL ? (void *)((char *)e->table - 0x20) : NULL;
+	return YES;
+}
+
+static id
+my_currentContext(id class, SEL selector)
+{
+	(void)class;
+	(void)selector;
+	return thread_context != NULL ? thread_context->object : nil;
+}
+
 /* Does the display's driver wait for the GPU before it shows a surface (iokit/Kernel/MiniIOMobileFramebuffer.cpp)? */
 static bool
 display_waits(void)
@@ -4219,6 +4500,10 @@ install(void)
 		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:", (IMP)my_texImageIOSurface },
 		{ "attachImage:toCoreSurface:invertedRender:", (IMP)my_attachImage },
 		{ "dealloc", (IMP)my_dealloc },
+		{ "renderbufferStorage:fromDrawable:", (IMP)my_renderbufferStorage },
+		{ "presentRenderbuffer:", (IMP)my_presentRenderbuffer },
+		{ "presentRenderbuffer:atTime:", (IMP)my_presentRenderbufferAtTime },
+		{ "presentRenderbuffer:afterMinimumDuration:", (IMP)my_presentRenderbufferAtTime },
 	};
 	Class class = objc_getClass("EAGLContext");
 	unsigned replaced = 0;
@@ -4357,6 +4642,27 @@ install(void)
 		}
 		replaced++;
 	}
+	/* the class's own: which context is current (for an application's gl* calls through OpenGLES.framework) */
+	{
+		static const struct {
+			const char *name;
+			IMP ours;
+		} class_methods[] = {
+			{ "setCurrentContext:", (IMP)my_setCurrentContext },
+			{ "currentContext", (IMP)my_currentContext },
+		};
+
+		for (unsigned i = 0; i < sizeof(class_methods) / sizeof(class_methods[0]); i++) {
+			Method method = class_getClassMethod(class, sel_registerName(class_methods[i].name));
+
+			if (method == NULL) {
+				say("hakios-gl: EAGLContext has no +%s\n", class_methods[i].name);
+				continue;
+			}
+			method_setImplementation(method, class_methods[i].ours);
+			replaced++;
+		}
+	}
 	say("hakios-gl: %u of %zu methods of EAGLContext are ours; OpenGL ES by %s\n", replaced,
-	    sizeof(methods) / sizeof(methods[0]), hakios_gl_library());
+	    sizeof(methods) / sizeof(methods[0]) + 2, hakios_gl_library());
 }

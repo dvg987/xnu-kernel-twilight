@@ -3,6 +3,12 @@
  * it: any of its drivers that draws into memory, reached through its off-screen interface
  * (OSMesa, given an OpenGL ES profile by tools/mesa/osmesa-es-profile.patch).
  *
+ * Which driver draws is Mesa's choice, made once a process, when the first context is made
+ * (gallium/targets/osmesa/osmesa_target.c, tvos/gpu/gl-patches/0002 of the twilight tree):
+ * gallium panfrost on the Mali-G310 where the kernel has a MaliService (MaliMetal's darwin-drm
+ * in the library talks to it), softpipe on this processor where it has none, or where the
+ * environment says OSMESA_SOFTWARE=1 (OSMESA_DEBUG_GPU=1: say why the GPU was not taken).
+ *
  * This file is all that knows which library draws. eagl.c wants four things besides the gl*
  * functions themselves: a context of a version of OpenGL ES, that context made the calling
  * thread's, a context taken away again, and a name for the log. A library with another way to
@@ -26,6 +32,7 @@
 #define OSMESA_ES_PROFILE               0x38
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_TEXTURE_2D                   0x0de1
+#define GL_VENDOR                       0x1f00
 #define GL_RENDERER                     0x1f01
 
 typedef struct osmesa_context *OSMesaContext;
@@ -87,25 +94,54 @@ hakios_gl_library(void)
 }
 
 /*
- * OES_EGL_image, with the IOSurface's ID as the image (tools/mesa/freedreno-darwin.patch: the
- * kernel's GPU driver makes a buffer of the surface's memory). The drivers that draw in memory
- * of their own with this processor are not asked: they refuse every time.
+ * Which of the library's drivers draws, told by the strings of the context (glGetString):
+ *   panfrost    the Mali-G310 (Valhall v10), through the kernel's MaliService: GL_RENDERER
+ *               "Mali-G310 (Panfrost)", GL_VENDOR "Mesa"
+ *   freedreno   an Adreno (HakiOS phones; not in the twilight build): GL_VENDOR "freedreno"
+ *   software    softpipe or llvmpipe, which draw in memory of their own with this processor
+ */
+enum driver { DRIVER_SOFTWARE, DRIVER_FREEDRENO, DRIVER_PANFROST, DRIVER_OTHER };
+
+static enum driver
+which_driver(void)
+{
+	const char *vendor = (const char *)glGetString(GL_VENDOR);
+	const char *renderer = (const char *)glGetString(GL_RENDERER);
+
+	if (renderer == NULL || strstr(renderer, "softpipe") != NULL || strstr(renderer, "llvmpipe") != NULL) {
+		return DRIVER_SOFTWARE;
+	}
+	if (vendor != NULL && strcmp(vendor, "freedreno") == 0) {
+		return DRIVER_FREEDRENO;
+	}
+	if (strstr(renderer, "Panfrost") != NULL) {
+		return DRIVER_PANFROST;
+	}
+	return DRIVER_OTHER;
+}
+
+/*
+ * OES_EGL_image, with the IOSurface's ID as the image: the GPU drivers make a texture of the
+ * surface's own memory. For panfrost the kernel makes a buffer object of the surface's pages
+ * (MALI_BO_CREATE_HOST, the import PanVK uses for Metal's IOSurfaces; gl-patches/0003); the
+ * surface must be 'BGRA', one plane, rows a multiple of 64 bytes, and page-aligned. Only the GPU
+ * drivers are asked: the others refuse every time.
  */
 int
 hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface)
 {
 	static void (*image_target)(unsigned target, void *image);
-	static int asked, software;
+	static int asked, shares;
 
 	(void)gl;
 	if (!asked) {
-		const char *renderer = (const char *)glGetString(GL_RENDERER);
+		enum driver driver = which_driver();
 
 		asked = 1;
 		image_target = (void (*)(unsigned, void *))OSMesaGetProcAddress("glEGLImageTargetTexture2DOES");
-		software = renderer == NULL || strstr(renderer, "softpipe") != NULL || strstr(renderer, "llvmpipe") != NULL;
+		shares = driver == DRIVER_FREEDRENO || driver == DRIVER_PANFROST;
 	}
-	if (image_target == NULL || software) {
+	if (image_target == NULL || !shares) {
 		return 0;
 	}
 	while (glGetError() != 0) {

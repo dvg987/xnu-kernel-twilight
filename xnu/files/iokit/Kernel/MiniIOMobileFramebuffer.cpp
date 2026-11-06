@@ -2213,6 +2213,16 @@ publishAccelerator(IOService * provider)
 			accelerator->setProperty("MetalPluginName", "NativeMaliMetal");
 			accelerator->setProperty("MetalPluginClassName", "NativeMaliMetalDevice");
 			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names NativeMaliMetal (the Mali-G310's, over PanVK) as its Metal plug-in\n");
+			/*
+			 * Boot-arg gles=1 as well: OpenGL ES (EAGLContext; libGFXShared reads these) is Apple's GL-on-Metal
+			 * renderer, AppleMetalGLRenderer.bundle, drawing with that Metal device -- what an AGX GPU names.
+			 */
+			uint32_t gles = 0;
+			if (PE_parse_boot_argn("gles", &gles, sizeof(gles)) && gles != 0) {
+				accelerator->setProperty("IOGLESBundleName", "AppleMetalGLRenderer");
+				accelerator->setProperty("IOGLESMetalBundleName", "AppleMetalGLRenderer");
+				IOLog("MiniIOMobileFramebuffer: gles=1: OpenGL ES through AppleMetalGLRenderer\n");
+			}
 		}
 		accelerator->registerService();
 	}
