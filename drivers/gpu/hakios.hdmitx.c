@@ -81,6 +81,33 @@ extern void IODelay(unsigned int microseconds);
 #define TPI_INFO_EN     0x6df
 #define TPI_DDC_MASTER_EN 0x6f8
 #define SCRCTL          0x900
+/* TOP */
+#define TOP_CLK_CNTL    0x004
+/* COR: the audio block (Amlogic's *_IVCTX names) */
+#define TPI_AVI_BYTE1   0x60d
+#define PKT_FILTER_0    0x245
+#define ACR_CTRL        0xa01
+#define FREQ_SVAL       0xa02
+#define N_SVAL1         0xa03
+#define ACR_CTS_CLK_DIV 0xa0e
+#define AUD_EN          0xa13
+#define AUD_MODE        0xa14
+#define SPDIF_SSMPL2    0xa19
+#define SPDIF_ERTH      0xa1b
+#define I2S_IN_MAP      0xa1c
+#define I2S_IN_CTRL     0xa1d
+#define I2S_CHST0       0xa1e
+#define ASRC            0xa25
+#define I2S_IN_SIZE     0xa26
+#define AIP_RST         0xa2c
+#define AIP_HDMI2MHL    0xa2d
+#define AUDP_TXCTRL     0xa2f
+#define TPI_AUD_CONFIG  0xa62
+#define VP_INPUT_SYNC_ADJUST 0xb1c
+#define INFOFRAME_AUDIO 2                       /* the generic packet buffer's slot of the audio infoframe */
+/* CLKCTRL */
+#define SYS_CLK_EN0_REG1 0x48                   /* bit 0: sys_audio, the audio block's bus clock */
+#define HTX_CLK_CTRL1   0x120                   /* the HDMI TX audio clock: [10:9] source, [8] enable, [6:0] divider - 1 */
 
 #define DDC_BUSLOW      (1u << 6)
 #define DDC_NACK        (1u << 5)
@@ -96,6 +123,10 @@ static struct {
 	uint32_t max_tmds_khz;                  /* the TV's (HF-VSDB, else the HDMI VSDB, else 165 MHz) */
 	bool ycbcr420;                          /* takes 4:2:0 (a 4:2:0 capability map or 4:2:0-only codes) */
 	bool pq, hlg, bt2020;                   /* ST 2084, HLG, BT.2020 YCC */
+	struct hakios_hdmitx_sad sads[HAKIOS_HDMITX_SADS];      /* the audio formats the sink lists (CTA-861 audio data block) */
+	unsigned sad_count;
+	uint8_t speakers;                       /* its speaker allocation (CTA-861 speaker allocation data block, byte 1) */
+	bool basic_audio;                       /* CTA-861 "basic audio": 2-channel LPCM at 32/44.1/48 kHz */
 	struct hakios_hdmitx_timing timings[HAKIOS_HDMITX_TIMINGS_MAX];
 	unsigned timing_count;
 	char name[14];
@@ -115,8 +146,15 @@ sip(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 }
 
 static uint32_t top_rd(uint32_t reg) { return (uint32_t)sip(SIP_READ, TOP_BASE + reg, 32, 0); }
+static void top_wr(uint32_t reg, uint32_t v) { (void)sip(SIP_WRITE, TOP_BASE + reg, v, 32); }
 static uint8_t cor_rd(uint32_t off) { return (uint8_t)sip(SIP_READ, COR_BASE + off, 8, 0); }
 static void cor_wr(uint32_t off, uint8_t v) { (void)sip(SIP_WRITE, COR_BASE + off, v, 8); }
+static void cor_bits(uint32_t off, unsigned shift, unsigned width, unsigned v)
+{
+	uint8_t mask = (uint8_t)(((1u << width) - 1) << shift);
+
+	cor_wr(off, (uint8_t)((cor_rd(off) & ~mask) | ((v << shift) & mask)));
+}
 
 static uint32_t rd(vm_offset_t base, uint32_t off) { return *(volatile uint32_t *)(base + off); }
 static uint32_t vpu(uint32_t reg) { return rd(h.vpu, reg * 4); }
@@ -269,6 +307,42 @@ show_dtd(const uint8_t *d)
 	    total ? (unsigned)(clock * 100000ull / total / 100) : 0, total ? (unsigned)(clock * 100000ull / total % 100) : 0);
 }
 
+/* CTA-861 audio format codes (short audio descriptor, byte 1 bits 6..3) */
+static const char *
+audio_format_name(unsigned format)
+{
+	static const char *const names[16] = {
+		"?", "LPCM", "AC-3", "MPEG-1", "MP3", "MPEG-2", "AAC LC", "DTS", "ATRAC", "DSD", "E-AC-3 (DD+)", "DTS-HD",
+		"MAT (TrueHD/Atmos)", "DST", "WMA Pro", "extension",
+	};
+
+	return names[format & 15];
+}
+
+/* What the sink says it plays: the short audio descriptors and its speakers. This is what a HAL device must offer. */
+static void
+show_audio(void)
+{
+	static const unsigned rate_hz[7] = { 32000, 44100, 48000, 88200, 96000, 176400, 192000 };
+	char line[96];
+
+	printf("hdmitx: sink audio: basic audio %u, %u descriptors, speaker allocation %#x\n", h.basic_audio, h.sad_count, h.speakers);
+	for (unsigned i = 0; i < h.sad_count; i++) {
+		const struct hakios_hdmitx_sad *sad = &h.sads[i];
+		unsigned at = 0;
+
+		line[0] = 0;
+		for (unsigned r = 0; r < 7; r++) {
+			if (sad->rates & (1u << r)) {
+				at += snprintf(line + at, sizeof(line) - at, " %u", rate_hz[r] / 1000);
+			}
+		}
+		printf("hdmitx: sink audio %u: %s, up to %u ch, kHz:%s, byte3 %#x%s\n", i, audio_format_name(sad->format),
+		    sad->channels, line, sad->extra,
+		    sad->format == 10 && (sad->extra & 1) ? " (JOC: Atmos in DD+)" : sad->format == 12 ? " (MAT)" : "");
+	}
+}
+
 /* What the CTA-861 extension says: video codes, the HDMI VSDB (physical address), HF-VSDB, HDR static metadata */
 static void
 parse_cta(const uint8_t *b)
@@ -287,7 +361,18 @@ parse_cta(const uint8_t *b)
 		if (i + 1 + len > 127) {
 			break;
 		}
-		if (tag == 2) {                                                         /* video data block */
+		if (tag == 1) {                                                         /* audio data block: short audio descriptors */
+			for (unsigned k = 0; k + 2 < len && h.sad_count < HAKIOS_HDMITX_SADS; k += 3) {
+				struct hakios_hdmitx_sad *sad = &h.sads[h.sad_count++];
+
+				sad->format = p[k] >> 3 & 15;
+				sad->channels = (uint8_t)((p[k] & 7) + 1);
+				sad->rates = p[k + 1] & 0x7f;
+				sad->extra = p[k + 2];
+			}
+		} else if (tag == 4 && len >= 3) {                                      /* speaker allocation */
+			h.speakers = p[0];
+		} else if (tag == 2) {                                                  /* video data block */
 			for (unsigned k = 0; k < len && at < sizeof(vics) - 6; k++) {
 				unsigned vic = p[k] >= 129 && p[k] <= 192 ? p[k] & 0x7f : p[k];
 
@@ -329,7 +414,9 @@ parse_cta(const uint8_t *b)
 		}
 		i += 1 + len;
 	}
+	h.basic_audio = (b[3] & 0x40) != 0;
 	printf("hdmitx: video codes (* native):%s\n", vics);
+	show_audio();
 	for (unsigned i = dtd; dtd >= 4 && i + 18 <= 127; i += 18) {
 		show_dtd(b + i);
 	}
@@ -491,6 +578,241 @@ make_timings(void)
 	}
 }
 
+/*
+ * Audio. The transmitter takes the audio block's I2S (TOHDMITX, see hakios.hdmiaudio.c) and sends it as audio sample
+ * packets (or high-bit-rate packets), the audio clock regeneration packet (N and CTS) and the audio infoframe. The
+ * sequence is Amlogic's hdmitx_set_audmode() (hdmitx21/hw/hdmi_tx_hw.c) for an I2S source, in the same order.
+ * Nothing here runs unless hakios.hdmiaudio.c asks (hdmiaudio=2 or more).
+ */
+static const struct {
+	uint32_t tmds_khz;
+	uint16_t n[3];                          /* for 32, 44.1 and 48 kHz (88.2/96 are twice, 176.4/192 four times that) */
+} acr_n[] = {
+	{ 74176, { 11648, 17836, 11648 } }, { 74250, { 4096, 6272, 6144 } },
+	{ 148352, { 11648, 8918, 5824 } }, { 148500, { 4096, 6272, 6144 } },
+	{ 296703, { 5824, 4459, 5824 } }, { 297000, { 3072, 4707, 5120 } },
+	{ 593407, { 5824, 8918, 5824 } }, { 594000, { 3072, 9408, 6144 } },
+};
+
+/* The TMDS character rate U-Boot (or our framebuffer driver) left, in kHz: the AVI frame's VIC, the colour depth, 4:2:0 */
+static uint32_t
+current_tmds_khz(bool *deep)
+{
+	uint8_t vic = cor_rd(TPI_AVI_BYTE4), p2t = cor_rd(P2T_CTRL), y = cor_rd(TPI_AVI_BYTE1) >> 5 & 3;
+	uint32_t pixel = 0, frac = rd(h.ana, HDMIPLL_CTRL3) & 0x1ffff;
+
+	for (unsigned i = 0; i < sizeof(cta) / sizeof(cta[0]); i++) {
+		if (cta[i].vic == vic) {
+			pixel = cta[i].pixel_khz;
+			/* the 1/1.001 twin has a fractional PLL; a whole-rate mode leaves the fraction at 0 */
+			if (cta[i].fractional && frac != 0) {
+				pixel = (uint32_t)((uint64_t)pixel * 1000 / 1001);
+			}
+		}
+	}
+	*deep = (p2t & 0x80) != 0 && (p2t & 3) != 0;
+	if (*deep) {
+		pixel = (p2t & 3) == 1 ? pixel * 5 / 4 : pixel * 3 / 2;
+	}
+	return y == 3 ? pixel / 2 : pixel;
+}
+
+static uint32_t
+acr_n_for(uint32_t rate, uint32_t tmds_khz, bool deep)
+{
+	unsigned base = rate % 11025 == 0 ? 1 : rate % 8000 == 0 ? 2 : 0;
+	unsigned mult = rate >= 176400 ? 4 : rate >= 88200 ? 2 : 1;
+	uint32_t n = base == 0 ? 4096 : base == 1 ? 6272 : 6144;
+
+	if (!deep) {
+		for (unsigned i = 0; i < sizeof(acr_n) / sizeof(acr_n[0]); i++) {
+			if (tmds_khz >= acr_n[i].tmds_khz - 1 && tmds_khz <= acr_n[i].tmds_khz + 1) {
+				n = acr_n[i].n[base];
+			}
+		}
+	}
+	/* (in deep colour the recommended N is another one; any N from 128 fs / 1500 to 128 fs / 300 is allowed: the default is) */
+	return n * mult;
+}
+
+/* The audio infoframe (CTA-861: type 0x84, version 1, 10 bytes): channel count, channel allocation; the rest "refer to header" */
+static void
+send_audio_infoframe(unsigned channels, unsigned ca)
+{
+	uint8_t f[31];
+	uint8_t sum = 0;
+
+	memset(f, 0, sizeof(f));
+	f[0] = 0x84;
+	f[1] = 0x01;
+	f[2] = 10;
+	f[4] = (uint8_t)(channels - 1);                                 /* PB1: coding type 0, channel count */
+	f[7] = (uint8_t)ca;                                             /* PB4 */
+	for (unsigned i = 0; i < 31; i++) {
+		sum += f[i];
+	}
+	f[3] = (uint8_t)(0 - sum);
+	cor_wr(TPI_INFO_FSEL, INFOFRAME_AUDIO);
+	for (unsigned i = 0; i < 31; i++) {
+		cor_wr(TPI_INFO_B0 + i, f[i]);
+	}
+	cor_wr(TPI_INFO_EN, 0xe0);
+}
+
+static void
+audio_mute(bool mute)
+{
+	cor_bits(AUD_EN, 0, 1, !mute);
+	cor_bits(AUDP_TXCTRL, 7, 1, mute);
+	cor_bits(TPI_AUD_CONFIG, 4, 1, mute);
+}
+
+void
+hakios_hdmitx_audio_stop(void)
+{
+	if (h.ana == 0) {
+		return;
+	}
+	audio_mute(true);
+}
+
+bool
+hakios_hdmitx_audio_start(const struct hakios_hdmitx_audio *a)
+{
+	uint32_t tmds, n;
+	bool deep;
+	unsigned lines, ca;
+	uint8_t chst[5] = { 0 };
+
+	if (h.ana == 0 || a->channels < 2 || a->channels > 8 || (a->channels & 1)) {
+		return false;
+	}
+	tmds = current_tmds_khz(&deep);
+	if (tmds == 0) {
+		printf("hdmitx: audio: no video mode on the wire (AVI VIC %u)\n", cor_rd(TPI_AVI_BYTE4));
+		return false;
+	}
+	n = acr_n_for(a->rate, tmds, deep);
+	lines = a->hbr ? 4 : a->channels / 2;
+	ca = a->ca != 0xff ? a->ca : a->channels == 2 ? 0x00 : a->channels == 4 ? 0x03 : a->channels == 6 ? 0x0b : 0x13;
+	/* consumer channel status, 4 bytes (Amlogic passes the same): byte 0 bit 1 = not audio, 1 = category general, 3 = sampling frequency */
+	chst[0] = a->nonaudio ? 0x02 : 0x00;
+	chst[1] = 0x01;
+	chst[3] = a->rate >= 192000 ? 0x0e : a->rate >= 176400 ? 0x0c : a->rate >= 96000 ? 0x0a : a->rate >= 88200 ? 0x08 :
+	    a->rate >= 48000 ? 0x02 : a->rate >= 44100 ? 0x00 : 0x03;
+	printf("hdmitx: audio: %u Hz, %u ch%s%s, TMDS %u kHz%s, N %u, %u lane(s)\n", a->rate, a->channels, a->hbr ? ", HBR" : "",
+	    a->nonaudio ? ", IEC 61937" : "", tmds, deep ? " (deep colour)" : "", n, lines);
+
+	cor_bits(AIP_RST, 0, 1, 1);
+	cor_bits(SPDIF_SSMPL2, 5, 1, 0);
+	top_wr(TOP_CLK_CNTL, (top_rd(TOP_CLK_CNTL) & ~(1u << 13)) | ((a->spdif ? 1u : 0u) << 13));    /* ACR measures i2s_mclk (0) or spdif_clk (1) */
+	cor_wr(AIP_HDMI2MHL, 0x00);
+	cor_wr(PKT_FILTER_0, 0x02);
+	cor_wr(ASRC, 0x00);
+	cor_wr(VP_INPUT_SYNC_ADJUST, 0x01);
+	/* sample packet layout 1 for more than two channels of PCM, layout 0 for HBR and for two channels; start muted */
+	cor_wr(AUDP_TXCTRL, (uint8_t)(0x80 | ((!a->hbr && a->channels > 2 && !a->nonaudio) ? 2 : 0)));
+	cor_bits(ACR_CTS_CLK_DIV, 4, 1, 0);
+	cor_wr(ACR_CTRL, 0x02);
+	cor_wr(N_SVAL1, (uint8_t)n);
+	cor_wr(N_SVAL1 + 1, (uint8_t)(n >> 8));
+	cor_wr(N_SVAL1 + 2, (uint8_t)(n >> 16));
+	cor_wr(FREQ_SVAL, 0);
+	cor_wr(TPI_AUD_CONFIG, 3 << 6);
+	if (!a->spdif) {
+		cor_wr(I2S_IN_MAP, 0xe4);
+		cor_wr(I2S_IN_CTRL, 0x20);
+		cor_wr(I2S_IN_SIZE, 0x0b);
+		for (unsigned i = 0; i < 5; i++) {
+			cor_wr(I2S_CHST0 + i, chst[i]);
+		}
+	}
+	cor_wr(SPDIF_ERTH, 0);
+	cor_wr(AUD_MODE, a->spdif ? 0x02 : (uint8_t)(((1u << lines) - 1) << 4 | (a->hbr ? 1u << 2 : 0)));
+	cor_wr(AUD_EN, 0x03);
+	send_audio_infoframe(a->channels, ca);
+	cor_bits(AIP_RST, 0, 1, 0);
+	audio_mute(false);
+	return true;
+}
+
+/* A look at what the transmitter's audio side holds now (read only) */
+void
+hakios_hdmitx_audio_show(void)
+{
+	uint8_t f[31];
+	bool on;
+
+	if (h.ana == 0) {
+		return;
+	}
+	printf("hdmitx: audio regs: AUD_EN %#x AUD_MODE %#x AUDP_TXCTRL %#x ACR_CTRL %#x N %u TPI_AUD_CONFIG %#x I2S_IN_CTRL %#x "
+	    "AIP_RST %#x CHST %02x %02x %02x %02x %02x\n", cor_rd(AUD_EN), cor_rd(AUD_MODE), cor_rd(AUDP_TXCTRL), cor_rd(ACR_CTRL),
+	    cor_rd(N_SVAL1) | cor_rd(N_SVAL1 + 1) << 8 | cor_rd(N_SVAL1 + 2) << 16, cor_rd(TPI_AUD_CONFIG), cor_rd(I2S_IN_CTRL),
+	    cor_rd(AIP_RST), cor_rd(I2S_CHST0), cor_rd(I2S_CHST0 + 1), cor_rd(I2S_CHST0 + 2), cor_rd(I2S_CHST0 + 3), cor_rd(I2S_CHST0 + 4));
+	printf("hdmitx: audio ACR: CTS (set) %u CTS (measured?) %u, FREQ_SVAL %#x, AUD_MODE %#x, I2S_IN_MAP %#x\n",
+	    cor_rd(0xa06) | cor_rd(0xa07) << 8 | cor_rd(0xa08) << 16, cor_rd(0xa09) | cor_rd(0xa0a) << 8 | cor_rd(0xa0b) << 16,
+	    cor_rd(FREQ_SVAL), cor_rd(AUD_MODE), cor_rd(I2S_IN_MAP));
+	printf("hdmitx: audio clocks: TOP clk cntl %#x, HTX_CLK_CTRL1 %#x (audio clock %s), sys_audio gate %s\n", top_rd(TOP_CLK_CNTL),
+	    rd(h.clk, HTX_CLK_CTRL1), rd(h.clk, HTX_CLK_CTRL1) & 0x100 ? "on" : "off",
+	    rd(h.clk, SYS_CLK_EN0_REG1) & 1 ? "open" : "closed");
+	on = infoframe(INFOFRAME_AUDIO, f);
+	printf("hdmitx: audio infoframe (slot %u) %s: %02x %02x %02x %02x %02x %02x %02x %02x\n", INFOFRAME_AUDIO, on ? "on" : "off",
+	    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+}
+
+/* The audio block's bus clock (CLKCTRL sys_audio): the audio registers hang the bus when it is closed. */
+bool
+hakios_hdmitx_audio_bus_clock(bool open)
+{
+	if (h.ana == 0) {
+		return false;
+	}
+	if (open && !(rd(h.clk, SYS_CLK_EN0_REG1) & 1)) {
+		*(volatile uint32_t *)(h.clk + SYS_CLK_EN0_REG1) |= 1;
+	}
+	return (rd(h.clk, SYS_CLK_EN0_REG1) & 1) != 0;
+}
+
+/* The audio clock of the transmitter itself (fclk_div5-ish, 200 MHz): U-Boot may have left it off */
+bool
+hakios_hdmitx_audio_clock(void)
+{
+	uint32_t v;
+
+	if (h.ana == 0) {
+		return false;
+	}
+	v = rd(h.clk, HTX_CLK_CTRL1);
+	if (!(v & 0x100)) {
+		v = (v & ~0x7fu & ~(3u << 9)) | 3u << 9 | 1;                  /* [10:9] = 3, divider 1 (÷2), as Amlogic's hdmitx21_set_audioclk() */
+		*(volatile uint32_t *)(h.clk + HTX_CLK_CTRL1) = v | 0x100;
+	}
+	return (rd(h.clk, HTX_CLK_CTRL1) & 0x100) != 0;
+}
+
+const struct hakios_hdmitx_sad *
+hakios_hdmitx_sads(unsigned *count, uint8_t *speakers)
+{
+	*count = h.sad_count;
+	if (speakers) {
+		*speakers = h.speakers;
+	}
+	return h.sad_count ? h.sads : NULL;
+}
+
+/* the sink lists a format (CTA-861 code, e.g. 1 LPCM, 2 AC-3, 10 E-AC-3, 12 MAT) with at least this many channels */
+bool
+hakios_hdmitx_sink_takes(unsigned format, unsigned channels, unsigned rate_bit)
+{
+	for (unsigned i = 0; i < h.sad_count; i++) {
+		if (h.sads[i].format == format && h.sads[i].channels >= channels && (h.sads[i].rates & rate_bit)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 const struct hakios_hdmitx_timing *
 hakios_hdmitx_timings(unsigned *count)
 {
@@ -520,6 +842,12 @@ hakios_hdmitx_physical_address(void)
 	return h.physical_address;
 }
 
+/* (the audio driver, when it is built, replaces this) */
+__attribute__((weak)) void
+hakios_hdmiaudio_init(void)
+{
+}
+
 void
 hakios_hdmitx_init(void)
 {
@@ -539,4 +867,5 @@ hakios_hdmitx_init(void)
 	show_state();
 	read_edid();
 	make_timings();
+	hakios_hdmiaudio_init();
 }

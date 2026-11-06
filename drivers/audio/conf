@@ -30,3 +30,6 @@ driver MIC
 driver VIRTIO_SOUND
 	file    bsd/dev/hakios.virtio_sound.c
 	help    QEMU's virtio sound device as the player of /dev/hakios-audio (virtio_sound=1). QEMU only
+
+standard bsd/dev/hakios.hdmiaudio.c
+	help    the Amlogic box's sound out of its HDMI transmitter (hdmiaudio=N, with hdmitx=1): TDM B to the transmitter, /dev/twl-audio
