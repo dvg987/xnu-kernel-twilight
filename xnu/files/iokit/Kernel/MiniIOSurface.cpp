@@ -27,6 +27,7 @@
 #include <kern/thread_call.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <sys/sysctl.h>
 
 #include "MiniIOSurface.h"
 
@@ -193,7 +194,12 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
  * are physically contiguous. That much in one piece is not to be had once the system runs: it is set aside when the driver starts.
  */
 static TUNABLE(uint32_t, gSurfaceFlip, "fb_flip", 0);
-#define SURFACES_SCANNED        4
+/*
+ * Two sets of four: a mode switch (Settings > Video and Audio) has the window server make its new frames before it lets
+ * the old ones go, and new frames without a piece cannot be scanned (the screen stayed black). Boot-arg fb_flip_pieces=N.
+ */
+#define SURFACES_SCANNED        8
+static TUNABLE(uint32_t, gSurfacePieces, "fb_flip_pieces", SURFACES_SCANNED);
 static struct {
 	IOBufferMemoryDescriptor *      memory;         /* (one reference is this table's) */
 	bool                            taken;
@@ -208,7 +214,7 @@ surfaceMemory(vm_size_t bytes, bool scanned)
 
 	if (scanned && gSurfaceKeptLock != NULL) {
 		IOLockLock(gSurfaceKeptLock);
-		for (unsigned i = 0; i < SURFACES_SCANNED && memory == NULL; i++) {
+		for (unsigned i = 0; i < SURFACES_SCANNED && i < gSurfacePieces && memory == NULL; i++) {
 			if (gSurfaceScanned[i].memory != NULL && !gSurfaceScanned[i].taken && gSurfaceScanned[i].memory->getCapacity() == bytes) {
 				gSurfaceScanned[i].taken = true;
 				memory = gSurfaceScanned[i].memory;
@@ -664,6 +670,13 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		s->release();
 		return NULL;
 	}
+	/*
+	 * 'b3a8' made as one plane of BGRA: the size asked for still has room for the alpha plane that is not made. A TV out's
+	 * frames are 'b3a8' (wide colour) and must be the panel's BGRA size to get one of the pieces the display scans.
+	 */
+	if (onePlane && wrapped == NULL && alloc > needed) {
+		alloc = (uint32_t) needed;
+	}
 	if (wrapped == NULL) {
 		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
 	} else {
@@ -925,12 +938,13 @@ MiniIOSurfaceStart(IOService * provider)
 		vm_size_t bytes = PAGE_SIZE + round_page((vm_size_t) vinfo.v_width * vinfo.v_height * 4);
 		unsigned made = 0;
 
-		for (unsigned i = 0; i < SURFACES_SCANNED; i++) {
+		for (unsigned i = 0; i < SURFACES_SCANNED && i < gSurfacePieces; i++) {
 			gSurfaceScanned[i].memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
 			    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0x000000fffffff000ULL);
 			made += gSurfaceScanned[i].memory != NULL;
 		}
-		IOLog("MiniIOSurface: fb_flip=1: %u of %u pieces of %lu bytes for the display to scan\n", made, SURFACES_SCANNED, (unsigned long) bytes);
+		IOLog("MiniIOSurface: fb_flip=1: %u of %u pieces of %lu bytes for the display to scan\n", made, gSurfacePieces < SURFACES_SCANNED ? gSurfacePieces : SURFACES_SCANNED,
+		    (unsigned long) bytes);
 	}
 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
 		gSurfaceTraceOf[0] = 0;
@@ -969,6 +983,11 @@ class IOSurfaceRootUserClient : public IOUserClient
 	uint32_t                        fRefCount;
 	uint32_t                        fRefCapacity;
 	IOExternalTrap                  fTraps[kSurfaceTrapCount];
+	IOSurfaceRootUserClient *       fNextClient;    /* on gSurfaceClients (gSurfaceLock) */
+	bool                            fListed;
+	int                             fPid;
+	char                            fName[20];
+	friend size_t surfaceListing(char * buf, size_t len);
 
 	struct minisurf_client_ref * findRef(uint32_t sid, bool detached);
 	struct minisurf_client_ref * addRef(MiniIOSurface * surface);
@@ -1008,6 +1027,62 @@ public:
 
 OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
 
+static IOSurfaceRootUserClient * gSurfaceClients;
+
+/*
+ * kern.hakios_surfaces: the surfaces of a megabyte or more, and who has each (pid, name, its use counts; "d": let go
+ * of, releasing), then each client's count of surfaces: for finding who keeps surfaces alive.
+ */
+size_t
+surfaceListing(char * buf, size_t len)
+{
+	size_t used = 0;
+#define SAY(...) do { if (used < len) used += (size_t) snprintf(buf + used, len - used, __VA_ARGS__); } while (0)
+	IOLockLock(gSurfaceLock);
+	SAY("%u surfaces, %llu MiB\n", gSurfaceCount, gSurfaceBytes >> 20);
+	for (uint32_t i = 1; i < MINISURF_TABLE_SIZE && used < len; i++) {
+		MiniIOSurface * s = gSurfaceTable[i];
+		if (s == NULL || s->info.allocSize < (1u << 20)) {
+			continue;
+		}
+		uint32_t f = s->info.pixelFormat;
+		SAY("%u %ux%u %c%c%c%c %uK h%u u%u/%u:", s->sid, s->info.width, s->info.height, (int) (f >> 24 & 0xff),
+		    (int) (f >> 16 & 0xff), (int) (f >> 8 & 0xff), (int) (f & 0xff), s->info.allocSize >> 10, s->holders,
+		    s->useCount[0], s->useCount[1]);
+		for (IOSurfaceRootUserClient * c = gSurfaceClients; c != NULL; c = c->fNextClient) {
+			for (uint32_t r = 0; r < c->fRefCount; r++) {
+				if (c->fRefs[r].surface == s) {
+					SAY(" %s[%d]%s%u/%u", c->fName, c->fPid, c->fRefs[r].detached ? "d" : "", c->fRefs[r].use[0], c->fRefs[r].use[1]);
+				}
+			}
+		}
+		SAY("\n");
+	}
+	for (IOSurfaceRootUserClient * c = gSurfaceClients; c != NULL; c = c->fNextClient) {
+		SAY("client %s[%d]: %u surfaces\n", c->fName, c->fPid, c->fRefCount);
+	}
+	IOLockUnlock(gSurfaceLock);
+#undef SAY
+	return used < len ? used : len - 1;
+}
+
+static int
+sysctl_surfaces SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	size_t len = 64 * 1024;
+	char * buf = (char *) IOMallocZeroData(len);
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	size_t used = surfaceListing(buf, len);
+	int error = SYSCTL_OUT(req, buf, used + 1);
+	IOFreeData(buf, len);
+	return error;
+}
+SYSCTL_PROC(_kern, OID_AUTO, hakios_surfaces, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_surfaces, "A",
+    "the big surfaces and who has them");
+
 bool
 IOSurfaceRootUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
 {
@@ -1015,6 +1090,8 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void * securityID, UInt
 		return false;
 	}
 	fTask = owningTask;
+	fPid = proc_selfpid();
+	proc_selfname(fName, sizeof(fName));
 	return true;
 }
 
@@ -1033,6 +1110,11 @@ IOSurfaceRootUserClient::start(IOService * provider)
 	for (unsigned i = 0; i < kSurfaceTrapCount; i++) {
 		fTraps[i].object = this;
 	}
+	IOLockLock(gSurfaceLock);
+	fNextClient = gSurfaceClients;
+	gSurfaceClients = this;
+	fListed = true;
+	IOLockUnlock(gSurfaceLock);
 	return true;
 }
 
@@ -1053,6 +1135,17 @@ IOSurfaceRootUserClient::clientClose(void)
 void
 IOSurfaceRootUserClient::free(void)
 {
+	if (fListed && gSurfaceLock != NULL) {
+		IOLockLock(gSurfaceLock);
+		for (IOSurfaceRootUserClient ** c = &gSurfaceClients; *c != NULL; c = &(*c)->fNextClient) {
+			if (*c == this) {
+				*c = fNextClient;
+				break;
+			}
+		}
+		fListed = false;
+		IOLockUnlock(gSurfaceLock);
+	}
 	if (fRefs != NULL) {
 		if (gSurfaceLock != NULL) {
 			IOLockLock(gSurfaceLock);

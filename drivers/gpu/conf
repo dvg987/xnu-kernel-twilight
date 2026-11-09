@@ -17,6 +17,18 @@ standard bsd/dev/hakios.hdmitx.c
 standard bsd/dev/hakios.vdec.c
 	help    the Amlogic box's video decoders (vdec=1): the DOS block's power, clocks and reset, its registers read back
 
+standard bsd/dev/hakios.hevc.c
+	help    the Amlogic box's HEVC decoder (Main, Main 10, up to 4K) behind the decoder node, with vdec=7
+
+standard bsd/dev/hakios.vp9.c
+	help    the Amlogic box's VP9 decoder (Profiles 0 and 2, up to 4K) behind the decoder node, with vdec=7
+
+standard bsd/dev/hakios.vp9_prob.c
+	help    its probability adaptation, which the core leaves to the CPU
+
+standard bsd/dev/hakios.vplane.c
+	help    the Amlogic box's video plane (VD1) under the OSD; for now kern.hakios_vpu, register bring-up commands
+
 standard bsd/dev/hakios.optee.c
 	help    a minimal OP-TEE client (optee=N): the secure world's identity and capabilities, and the video decoders'
 	help    firmware handed to the video TA (fw/526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta, fw/video_ucode.bin)

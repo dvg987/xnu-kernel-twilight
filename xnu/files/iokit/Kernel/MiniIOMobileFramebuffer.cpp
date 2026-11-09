@@ -21,12 +21,16 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSString.h>
 #include <kern/thread_call.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <sys/sysctl.h>
+static int gFbTrace;
+SYSCTL_INT(_kern, OID_AUTO, hakios_fb_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &gFbTrace, 0, "");
 
 extern "C" {
 #include <console/video_console.h>
@@ -38,6 +42,23 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+/* hakios.vplane.c: the video plane shows through where this frame has its key colour (alpha cleared there) */
+extern "C" {
+#include "../../bsd/sys/hakios.hdmitx.h"
+}
+extern "C" void hakios_vplane_osd_frame(uint8_t * pixels, uint32_t bytesPerRow, uint32_t width, uint32_t height);
+/* ... and shows a swap's video layer under it (sys/hakios.vplane.h; the token is sys/hakios.vdec.h's) */
+struct hakios_vplane_surface {
+	const uint8_t * luma, * chroma;
+	uint32_t lumaStride, chromaStride;
+	uint32_t width, height;
+	const void * token;
+	uint32_t x, y, w, h;
+};
+extern "C" void hakios_vplane_surface(const struct hakios_vplane_surface * surface);
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+#define TWL_VPLANE_TOKEN_KEY    "TwlVideoPlanePicture"
+#define TWL_VPLANE_TOKEN_SIZE   24
 
 /* IOConnectCallMethod selectors of the framebuffer user client (Darwin userland 16.5) */
 enum {
@@ -49,6 +70,7 @@ enum {
 	kFBMethodGetDisplaySize         = 8,
 	kFBMethodRequestPowerChange     = 12,
 	kFBMethodSwapSignal             = 20,
+	kFBMethodSetDigitalOutMode      = 23,
 	kFBMethodGetDigitalOutState     = 25,
 	kFBMethodGetDotPitch            = 28,
 	kFBMethodGetDisplayArea         = 29,
@@ -113,6 +135,35 @@ static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
 static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
 static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+/*
+ * IOMobileFramebufferGetDigitalOutState (selector 25): what a TV-out display (fb_external) says of its HDMI link.
+ * CoreAnimation asks it twice at start and draws nothing while it is 0. Boot-arg fb_dostate=N, sysctl kern.fb_dostate.
+ */
+static uint32_t gDigitalOutState = 2;
+SYSCTL_UINT(_kern, OID_AUTO, fb_dostate, CTLFLAG_RW | CTLFLAG_LOCKED, &gDigitalOutState, 0, "IOMFB digital out state (selector 25)");
+
+/*
+ * A TV out (fb_external, 2 by default): to CoreAnimation an Apple TV's HDMI display, with its modes' colour and HDR.
+ * backboardd's hook (tvos/src/twlhook.c) keeps it drawing 1920x1080 frames, which the OSD scans and the VPP scales to the
+ * timing. The hooks of backboardd and PineBoard read kern.fb_external.
+ */
+static uint32_t gTVOut;
+SYSCTL_UINT(_kern, OID_AUTO, fb_external, CTLFLAG_RD | CTLFLAG_LOCKED, &gTVOut, 0, "IOMFB: the display is a TV out (1 external, 2 AppleTV)");
+static TUNABLE(uint32_t, gTVSize, "fb_tvsize", 0);
+
+/* the last "frames now" line (kern.fb_frames): what the window server draws, for when the log has gone round */
+static char gFramesNow[160];
+SYSCTL_STRING(_kern, OID_AUTO, fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, gFramesNow, sizeof(gFramesNow), "IOMFB: the frames last seen");
+
+static void
+shownSize(uint32_t fw, uint32_t fh, uint32_t * w, uint32_t * h)
+{
+	/* (boot-arg fb_tvsize=1: the timing's size; by default the framebuffer's, which backboardd's hook gives the window server) */
+	uint32_t tw = gTVOut && gTVSize ? hakios_hdmitx_output_width() : 0, th = gTVOut && gTVSize ? hakios_hdmitx_output_height() : 0;
+
+	*w = tw != 0 && th != 0 ? tw : fw;
+	*h = tw != 0 && th != 0 ? th : fh;
+}
 
 /*
  * A recording of the screen, for a machine one cannot look at while it runs (the phone is
@@ -378,6 +429,8 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void showVideo(const uint8_t * swap, MiniIOSurface * v, const int32_t src[4], const int32_t dst[4], const int32_t mainDst[4],
+	    uint32_t mainW, uint32_t mainH);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool fSettling;                 /* drawing the last frame again, filtered (fb_filter=2) */
 	bool fScanning;                 /* fb_flip: the display is scanning a surface, not the panel's memory */
@@ -451,8 +504,183 @@ IOMobileFramebuffer::publishRefresh(void)
 	setNumber(refresh, "displayRefreshStepMachTime", ticks);
 	setProperty("IOMFBDisplayRefresh", refresh);
 	refresh->release();
+
+	/*
+	 * The largest source a layer of a swap can have (QuartzCore's AppleDisplay reads IOMFBMaxSrcPixels; without it a
+	 * layer more than 1920 wide is drawn into the frame by the GPU instead). The video plane takes up to 4096x2304 and
+	 * scales it to its rectangle (hakios.vplane.c): a 1440p or 4K video layer goes to it as it is. (AppleDisplay keeps
+	 * the smaller of the buffer's width and height and holds both of a layer's sides to it: so both 4096.)
+	 */
+	OSDictionary * limits = OSDictionary::withCapacity(4);
+	if (limits != NULL) {
+		setNumber(limits, "MaxSrcBufferWidth", 4096);
+		setNumber(limits, "MaxSrcBufferHeight", 4096);
+		setNumber(limits, "MaxSrcRectWidth", 4096);
+		setNumber(limits, "MaxSrcRectTotal", 4096 * 2304);
+		setNumber(limits, "MaxVideoSrcDownscalingWidth", 4096);
+		setProperty("IOMFBMaxSrcPixels", limits);
+		limits->release();
+	}
+	/*
+	 * How far a layer of a swap may be scaled (QuartzCore's DisplayLimits::update_display_scaling: the smallest scale is
+	 * 1 / *_MinScaleFraction, the largest *_MaxScale). Without it a video layer smaller than its picture -- YouTube's
+	 * player shrunk beside its settings -- was drawn into the frame by the GPU, which converts every new video buffer
+	 * into an image of its own: backboardd grew by 16 MB a frame to 634 MB and was killed. The video plane scales a
+	 * picture down to a quarter and up as far as the screen; RGB layers other than the frame are not shown, so not those.
+	 */
+	OSDictionary * scaling = OSDictionary::withCapacity(4);
+	if (scaling != NULL) {
+		setNumber(scaling, "RGBLayer_MinScaleFraction", 1);
+		setNumber(scaling, "RGBLayer_MaxScale", 1);
+		setNumber(scaling, "YUVLayer_MinScaleFraction", 4);
+		setNumber(scaling, "YUVLayer_MaxScale", 8);
+		setProperty("IOMFBScalingLimits", scaling);
+		scaling->release();
+	}
 	IOLog("MiniIOMobileFramebuffer: IOMFBDisplayRefresh: %u Hz (the panel: %u), an interval of %llu (2^-32 s), %llu ticks\n",
 	    told, refreshHz(), interval, ticks);
+}
+
+/*
+ * With a TV's EDID (hakios.hdmitx.c): one TimingElement per timing the TV lists that the box can drive, each with its
+ * SDR colour elements (YCbCr 4:2:2 12-bit, 4:4:4, 4:2:0, RGB as the link allows), the IDs the HDMI driver uses, so
+ * SetDigitalOutMode (selector 23) and the current mode (block 0x40) speak the same numbers. The display stays the
+ * framebuffer's size (GetDisplaySize): CoreAnimation draws 1920x1080 and the VPU scales it to the timing.
+ */
+static OSDictionary *
+colorElement(const struct hakios_hdmitx_color * k)
+{
+	OSDictionary * c = OSDictionary::withCapacity(8);
+
+	if (c != NULL) {
+		setNumber(c, "ID", k->id);
+		setNumber(c, "PixelEncoding", k->encoding);
+		setNumber(c, "Depth", k->depth);
+		setNumber(c, "Colorimetry", k->colorimetry);
+		setNumber(c, "EOTF", k->eotf);
+		setNumber(c, "DynamicRange", k->range);
+		setNumber(c, "Score", k->id == 3 ? 4 : k->id == 2 ? 3 : k->id == 4 ? 2 : 1);
+		c->setObject("IsVirtual", kOSBooleanFalse);
+	}
+	return c;
+}
+
+static bool
+publishTVModes(IOService * fb)
+{
+	unsigned count = 0;
+	const struct hakios_hdmitx_timing * t = hakios_hdmitx_timings(&count);
+	OSArray * timings, * colors;
+
+	if (t == NULL || count == 0) {
+		return false;
+	}
+	timings = OSArray::withCapacity(count);
+	colors = OSArray::withCapacity(4);
+	if (timings == NULL || colors == NULL) {
+		OSSafeReleaseNULL(timings);
+		OSSafeReleaseNULL(colors);
+		return false;
+	}
+	for (unsigned c = 0; c < hakios_hdmitx_color_count(); c++) {    /* (SDR; HDR10 too with hdmitx_hdrmodes=1) */
+		OSDictionary * e = colorElement(&hakios_hdmitx_colors[c]);
+
+		if (e != NULL) {
+			colors->setObject(e);
+			e->release();
+		}
+	}
+	for (unsigned i = 0; i < count; i++, t++) {
+		OSDictionary * timing = OSDictionary::withCapacity(8);
+		OSDictionary * horizontal = OSDictionary::withCapacity(4);
+		OSDictionary * vertical = OSDictionary::withCapacity(4);
+		OSArray * modes = OSArray::withCapacity(4);
+		unsigned hz = t->rate >> 16;
+
+		if (timing == NULL || horizontal == NULL || vertical == NULL || modes == NULL) {
+			OSSafeReleaseNULL(timing);
+			OSSafeReleaseNULL(horizontal);
+			OSSafeReleaseNULL(vertical);
+			OSSafeReleaseNULL(modes);
+			continue;
+		}
+		for (unsigned c = 0; c < hakios_hdmitx_color_count(); c++) {
+			if (t->colors & (1u << c)) {
+				OSDictionary * e = colorElement(&hakios_hdmitx_colors[c]);
+
+				if (e != NULL) {
+					modes->setObject(e);
+					e->release();
+				}
+			}
+		}
+		setNumber(horizontal, "Active", t->width);
+		setNumber(horizontal, "Total", t->htotal);
+		setNumber(horizontal, "SyncRate", t->rate);
+		setNumber(horizontal, "PreciseSyncRate", t->rate);
+		setNumber(vertical, "Active", t->height);
+		setNumber(vertical, "Total", t->vtotal);
+		setNumber(vertical, "SyncRate", t->rate);
+		setNumber(vertical, "PreciseSyncRate", t->rate);
+		setNumber(timing, "ID", t->id);
+		setNumber(timing, "Score", (uint32_t) t->height * 1000 + (hz == 60 ? 300 : hz == 50 ? 200 : hz) + (t->fractional ? 0 : 1));
+		timing->setObject("IsVirtual", kOSBooleanFalse);
+		timing->setObject("IsOverscanned", kOSBooleanFalse);
+		timing->setObject("HorizontalAttributes", horizontal);
+		timing->setObject("VerticalAttributes", vertical);
+		timing->setObject("ColorModes", modes);
+		if (modes->getCount() != 0) {
+			timings->setObject(timing);
+		}
+		timing->release();
+		horizontal->release();
+		vertical->release();
+		modes->release();
+	}
+	fb->setProperty("TimingElements", timings);
+	fb->setProperty("ColorElements", colors);
+	{
+		/* what tvOS reads of the TV (CADisplayAttributes: pqEOTF, bt2020YCC, hdrStaticMetadataType1, the product) */
+		bool pq = false, hlg = false, bt2020 = false;
+		const char * name = hakios_hdmitx_tv(&pq, &hlg, &bt2020);
+		OSDictionary * attributes = OSDictionary::withCapacity(8);
+		OSDictionary * product = OSDictionary::withCapacity(2);
+
+		if (attributes != NULL && product != NULL) {
+			attributes->setObject("SupportsPQEOTF", pq ? kOSBooleanTrue : kOSBooleanFalse);
+			attributes->setObject("SupportsHLGEOTF", hlg ? kOSBooleanTrue : kOSBooleanFalse);
+			attributes->setObject("SupportsBT2020YCC", bt2020 ? kOSBooleanTrue : kOSBooleanFalse);
+			attributes->setObject("SupportsHDRStaticMetadataType1", pq ? kOSBooleanTrue : kOSBooleanFalse);
+			attributes->setObject("SupportsDiscreteMediaRefreshRate", kOSBooleanFalse);
+			if (name != NULL && name[0] != 0) {
+				OSString * n = OSString::withCString(name);
+
+				if (n != NULL) {
+					product->setObject("ProductName", n);
+					n->release();
+				}
+			}
+			attributes->setObject("ProductAttributes", product);
+			fb->setProperty("DisplayAttributes", attributes);
+		}
+		OSSafeReleaseNULL(attributes);
+		OSSafeReleaseNULL(product);
+	}
+	IOLog("MiniIOMobileFramebuffer: %u modes of the TV published (TimingElements)\n", timings->getCount());
+	timings->release();
+	colors->release();
+	return true;
+}
+
+static IOMobileFramebuffer * gModesFB;
+
+/* the HDMI driver read an EDID or set a mode: the modes again (from its hot-plug thread) */
+static void
+tvChanged(void)
+{
+	if (gModesFB != NULL) {
+		(void) publishTVModes(gModesFB);
+	}
 }
 
 void
@@ -467,6 +695,18 @@ IOMobileFramebuffer::publishModes(void)
 	const uint32_t rate = refreshHz() << 16;                /* 16.16 fixed point */
 
 	if (timing == NULL || horizontal == NULL || vertical == NULL || color == NULL || timings == NULL || colors == NULL) {
+		return;
+	}
+	gModesFB = this;
+	hakios_hdmitx_set_listener(tvChanged);
+	if (publishTVModes(this)) {
+		publishRefresh();
+		OSSafeReleaseNULL(timings);
+		OSSafeReleaseNULL(colors);
+		OSSafeReleaseNULL(timing);
+		OSSafeReleaseNULL(horizontal);
+		OSSafeReleaseNULL(vertical);
+		OSSafeReleaseNULL(color);
 		return;
 	}
 	setNumber(color, "ID", kFBColorID);
@@ -618,6 +858,23 @@ IOMobileFramebuffer::start(IOService * provider)
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
 	setProperty("HakiosWaitsForGPU", kOSBooleanTrue);
 	publishModes();
+	/*
+	 * Boot-arg fb_external (2): the display is an Apple TV's HDMI display to IOMobileFramebuffer.framework (it searches
+	 * the registry for a boolean "AppleTV"; 1: "external"), so CoreAnimation treats it as a TV: HDMI modes with colour
+	 * and HDR. 0: a built-in panel (its modes all "fixed", SDR 8-bit).
+	 */
+	{
+		uint32_t external = 2;
+
+		(void) PE_parse_boot_argn("fb_external", &external, sizeof(external));
+		(void) PE_parse_boot_argn("fb_dostate", &gDigitalOutState, sizeof(gDigitalOutState));
+		gTVOut = external;
+		if (external == 1) {
+			setProperty("external", kOSBooleanTrue);
+		} else if (external == 2) {
+			setProperty("AppleTV", kOSBooleanTrue);           /* (what the framework looks for on an Apple TV's display) */
+		}
+	}
 	setName("disp0");
 	registerService();
 	return true;
@@ -904,10 +1161,13 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		sw = (int32_t) s->info.width;
 		sh = (int32_t) s->info.height;
 	}
+	uint32_t shownW, shownH;
+
+	shownSize(fWidth, fHeight, &shownW, &shownH);
 	if (dw <= 0 || dh <= 0) {
 		dx = dy = 0;
-		dw = (int32_t) fWidth;
-		dh = (int32_t) fHeight;
+		dw = (int32_t) shownW;
+		dh = (int32_t) shownH;
 	}
 	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
 		return;
@@ -920,10 +1180,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	 * the rectangle on the panel, worked out in 64 bits: the request's numbers are the caller's, and a
 	 * rectangle of billions of rows is not drawn (nor looked at row by row)
 	 */
-	int64_t qx0 = (int64_t) dx * fPanelWidth / fWidth;
-	int64_t qy0 = (int64_t) dy * fPanelHeight / fHeight;
-	int64_t qx1 = ((int64_t) dx + dw) * fPanelWidth / fWidth;
-	int64_t qy1 = ((int64_t) dy + dh) * fPanelHeight / fHeight;
+	int64_t qx0 = (int64_t) dx * fPanelWidth / shownW;
+	int64_t qy0 = (int64_t) dy * fPanelHeight / shownH;
+	int64_t qx1 = ((int64_t) dx + dw) * fPanelWidth / shownW;
+	int64_t qy1 = ((int64_t) dy + dh) * fPanelHeight / shownH;
 
 	if (qx0 < -DST_LIMIT || qy0 < -DST_LIMIT || qx1 > DST_LIMIT || qy1 > DST_LIMIT) {
 		return;
@@ -1260,6 +1520,8 @@ static struct {
 	uint32_t                blankMisses;    /* flips that did not find the blanking in time */
 } gScan;
 
+static bool scannableSize(const MiniIOSurface * s);
+
 static void
 gopInit(void * base, uint32_t width, uint32_t height, uint32_t rowBytes)
 {
@@ -1380,8 +1642,7 @@ native_gop_handoff_call(uint32_t op, task_t task, const void * in, size_t inSize
 		if (s == NULL) {
 			return kIOReturnNotFound;
 		}
-		if (s->info.width != gGop.width || s->info.height != gGop.height || s->info.bytesPerRow != gGop.stride ||
-		    MiniIOSurfaceScanAddress(s) == 0) {
+		if (!scannableSize(s) || MiniIOSurfaceScanAddress(s) == 0) {
 			static uint32_t refused;
 
 			if (refused++ % 200 == 0) {
@@ -1492,14 +1753,19 @@ static void
 waitForBlanking(void)
 {
 	const uint32_t lines = gScan.vpu[ENCP_VIDEO_MAX_LNCNT] + 1, begin = gScan.vpu[ENCP_DE_V_BEGIN], end = gScan.vpu[ENCP_DE_V_END];
-	const uint64_t perLine = (uint64_t) (NSEC_PER_SEC / refreshHz()) / lines;
+	/* the mode's own frame (41.7 ms at 23.976 Hz: two frames at refreshHz()'s 60 gave up before its blanking came) */
+	uint64_t frame = hakios_hdmitx_frame_ns();
+	if (frame == 0) {
+		frame = NSEC_PER_SEC / refreshHz();
+	}
+	const uint64_t perLine = frame / lines;
 	uint64_t ticks, deadline;
 	uint32_t line = gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff;
 
 	if (end <= begin || end >= lines || line >= end || line < begin) {
 		return;
 	}
-	clock_interval_to_deadline(2 * NSEC_PER_SEC / refreshHz() / NSEC_PER_USEC, NSEC_PER_USEC, &deadline);
+	clock_interval_to_deadline(2 * frame / NSEC_PER_USEC, NSEC_PER_USEC, &deadline);
 	while (mach_absolute_time() < deadline) {
 		line = gScan.vpu[ENCP_INFO_READ] >> 16 & 0x1fff;
 		if (line >= end || line < begin) {
@@ -1514,6 +1780,44 @@ waitForBlanking(void)
 		}
 	}
 	gScan.blankMisses++;
+}
+
+/*
+ * A frame the display can scan as it is: the panel's size. In a 720p mode the window server still draws 1920x1080 pictures
+ * into its 1920x1080 surfaces, but names the swap's rectangles in the mode's pixels (from and to 0,0 1280x720): the OSD
+ * scans the whole surface and its scaler makes the 720p picture. What the OSD is set to scan, to change it only when needed.
+ */
+static uint32_t gScanW, gScanH, gScanStride;
+
+static bool
+scannableSize(const MiniIOSurface * s)
+{
+	return s->info.width == gGop.width && s->info.height == gGop.height && s->info.bytesPerRow == gGop.stride;
+}
+
+/* a 720p mode on the wire (with the panel's 1920x1080 frames) */
+static bool
+smallOutput(void)
+{
+	return hakios_hdmitx_output_height() == 720 && gGop.width >= 1280 && gGop.height >= 720;
+}
+
+
+/* (in the blanking) */
+static void
+scanSource(uint32_t w, uint32_t h, uint32_t stride)
+{
+	if (gScanW == 0) {
+		gScanW = gGop.width;                    /* (what U-Boot and twloader left: the panel) */
+		gScanH = gGop.height;
+		gScanStride = gGop.stride;
+	}
+	if (w != gScanW || h != gScanH || stride != gScanStride) {
+		hakios_hdmitx_osd_source(w, h, stride);
+		gScanW = w;
+		gScanH = h;
+		gScanStride = stride;
+	}
 }
 
 /* The display scans this surface from now on; its hold passes to gScan. false: it cannot. */
@@ -1532,9 +1836,13 @@ IOMobileFramebuffer::scanFrom(MiniIOSurface * s)
 	uint64_t left;
 	MiniIOSurface * old;
 
+	if (s->kpixels != NULL) {
+		hakios_vplane_osd_frame(s->kpixels + s->info.offset, s->info.bytesPerRow, s->info.width, s->info.height);
+	}
 	waitForBlanking();
 	/* (the old surface is done with as the next picture starts, at most the blanking away) */
 	nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC + (uint64_t) gFlipLag * (NSEC_PER_SEC / refreshHz()), &left);
+	scanSource(s->info.width, s->info.height, s->info.bytesPerRow);
 	gScan.vpu[VIU_OSD1_BLK1_CFG_W4] = (uint32_t) (address >> 4);
 	IOLockLock(gGop.lock);
 	old = gScan.current;
@@ -1558,6 +1866,7 @@ IOMobileFramebuffer::scanPanel(void)
 {
 	MiniIOSurface * old;
 
+	scanSource(gGop.width, gGop.height, gGop.stride);
 	gScan.vpu[VIU_OSD1_BLK1_CFG_W4] = (uint32_t) (gGop.panelPhys >> 4);
 	IOLockLock(gGop.lock);
 	old = gScan.current;
@@ -1570,13 +1879,83 @@ IOMobileFramebuffer::scanPanel(void)
 	fStatFlipsLeft++;
 }
 
+/*
+ * A swap's video layer to the video plane, in the frame's own pixels (the swap places both on the display); a few swaps
+ * in a row without one and the plane is let go (the window server leaves it out of a swap now and then).
+ */
+void
+IOMobileFramebuffer::showVideo(const uint8_t * swap, MiniIOSurface * v, const int32_t src[4], const int32_t dst[4],
+    const int32_t mainDst[4], uint32_t mainW, uint32_t mainH)
+{
+	static uint32_t without, reports;
+	struct hakios_vplane_surface p = {};
+
+	if (v == NULL || v->kpixels == NULL || mainW == 0 || mainH == 0 || mainDst[2] <= 0 || mainDst[3] <= 0) {
+		if (++without == 15) {
+			hakios_vplane_surface(NULL);
+		}
+		return;
+	}
+	without = 0;
+	int64_t x0 = (int64_t) (dst[0] - mainDst[0]) * mainW / mainDst[2], y0 = (int64_t) (dst[1] - mainDst[1]) * mainH / mainDst[3];
+	int64_t x1 = (int64_t) (dst[0] + dst[2] - mainDst[0]) * mainW / mainDst[2];
+	int64_t y1 = (int64_t) (dst[1] + dst[3] - mainDst[1]) * mainH / mainDst[3];
+	int32_t sx = src[0] < 0 ? 0 : src[0] & ~1, sy = src[1] < 0 ? 0 : src[1] & ~1;
+	uint32_t sw = src[2] > 0 ? (uint32_t) src[2] : v->info.width, sh = src[3] > 0 ? (uint32_t) src[3] : v->info.height;
+
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > mainW ? mainW : x1;
+	y1 = y1 > mainH ? mainH : y1;
+	if ((uint32_t) sx + sw > v->planes[0].width) {
+		sw = v->planes[0].width > (uint32_t) sx ? v->planes[0].width - (uint32_t) sx : 0;
+	}
+	if ((uint32_t) sy + sh > v->planes[0].height) {
+		sh = v->planes[0].height > (uint32_t) sy ? v->planes[0].height - (uint32_t) sy : 0;
+	}
+	if (reports < 6) {
+		reports++;
+		IOLog("MiniIOMobileFramebuffer: swap %u: video layer surface %u (%ux%u '%c%c%c%c', rows %u/%u at %u/%u) from %d,%d %dx%d "
+		    "to %d,%d %dx%d; the frame %ux%u to %d,%d %dx%d: %lld,%lld to %lld,%lld in it\n", swapWord(swap, SWAP_ID), v->sid,
+		    v->info.width, v->info.height, (int) (v->info.pixelFormat >> 24 & 0xff), (int) (v->info.pixelFormat >> 16 & 0xff),
+		    (int) (v->info.pixelFormat >> 8 & 0xff), (int) (v->info.pixelFormat & 0xff), v->planes[0].bytesPerRow,
+		    v->planes[1].bytesPerRow, v->planes[0].offset, v->planes[1].offset, src[0], src[1], src[2], src[3], dst[0], dst[1],
+		    dst[2], dst[3], mainW, mainH, mainDst[0], mainDst[1], mainDst[2], mainDst[3], x0, y0, x1, y1);
+	}
+	if (x1 - x0 < 16 || y1 - y0 < 16 || sw < 16 || sh < 16) {
+		return;
+	}
+	p.width = sw;
+	p.height = sh;
+	p.x = (uint32_t) x0;
+	p.y = (uint32_t) y0;
+	p.w = (uint32_t) (x1 - x0);
+	p.h = (uint32_t) (y1 - y0);
+	OSData * token = v->values != NULL ? OSDynamicCast(OSData, v->values->getObject(TWL_VPLANE_TOKEN_KEY)) : NULL;
+	if (token != NULL && token->getLength() == TWL_VPLANE_TOKEN_SIZE) {
+		p.token = token->getBytesNoCopy();
+	} else {
+		/* (whoever wrote it, the CPU or the GPU: what is read is memory) */
+		uint8_t * base = v->kpixels;
+
+		p.lumaStride = v->planes[0].bytesPerRow;
+		p.chromaStride = v->planes[1].bytesPerRow;
+		p.luma = base + v->planes[0].offset + (size_t) sy * p.lumaStride + (uint32_t) sx;
+		p.chroma = base + v->planes[1].offset + (size_t) (sy / 2) * p.chromaStride + (uint32_t) sx;
+		FlushPoC_DcacheRegion((vm_offset_t) p.luma, (size_t) sh * p.lumaStride);
+		FlushPoC_DcacheRegion((vm_offset_t) p.chroma, (size_t) (sh / 2) * p.chromaStride);
+	}
+	hakios_vplane_surface(&p);
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
-	uint32_t layers = 0;
+	uint32_t layers = 0, mainW = 0, mainH = 0;
+	int32_t videoSrc[4] = {}, videoDst[4] = {}, mainDst[4] = {};
 	MiniIOSurface * recorded = NULL, * next = NULL;
 	bool report, scanned = false, alone = true;
 	uint32_t sid = 0;
@@ -1589,8 +1968,72 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		IOLockUnlock(gGop.lock);
 		next = sid != 0 ? MiniIOSurfaceCopy(sid) : next;
 	}
-	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
-		alone = alone && swapWord(swap, SWAP_SURFACE(layer)) == 0;
+	/*
+	 * The frame: the lowest layer with a 32-bit surface; the window server moves it to layer 1 when a video layer comes
+	 * (an NV12 surface: AVSampleBufferDisplayLayer's frames, which it does not draw), and that goes to the video plane,
+	 * under the frame.
+	 */
+	int mainLayer = -1, videoLayer = -1;
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		MiniIOSurface * t = surfaces[layer];
+
+		if (swapWord(swap, SWAP_SURFACE(layer)) == 0 || t == NULL) {
+			continue;
+		}
+		if (t->info.bytesPerElement == 4 && t->info.planeCount == 0) {
+			mainLayer = mainLayer < 0 ? (int) layer : mainLayer;
+		} else if (videoLayer < 0 && t->info.planeCount == 2 && t->planes[0].bytesPerElement == 1 &&
+		    t->planes[1].bytesPerElement == 2) {
+			videoLayer = (int) layer;
+		} else {
+			static uint32_t odd;
+
+			if (odd++ < 4) {
+				IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u ('%c%c%c%c', %u planes) is not one shown\n",
+				    swapWord(swap, SWAP_ID), layer, t->sid, (int) (t->info.pixelFormat >> 24 & 0xff),
+				    (int) (t->info.pixelFormat >> 16 & 0xff), (int) (t->info.pixelFormat >> 8 & 0xff),
+				    (int) (t->info.pixelFormat & 0xff), t->info.planeCount);
+			}
+		}
+	}
+	if (mainLayer < 0) {
+		mainLayer = 0;
+	}
+	/* (diagnosis: what the window server's frame holds, 16 x 9 pixels looked at: transparent (the video shows), opaque
+	 * black, or anything else; a frame with nothing else and no video under it is a black screen) */
+	if (surfaces[mainLayer] != NULL && surfaces[mainLayer]->kpixels != NULL && surfaces[mainLayer]->info.bytesPerElement == 4) {
+		static uint32_t empties, said, last_kind = 99;
+		MiniIOSurface * f = surfaces[mainLayer];
+		const uint8_t * px = f->kpixels + f->info.offset;
+		unsigned clear = 0, black = 0, other = 0;
+
+		for (unsigned gy = 0; gy < 9; gy++) {
+			for (unsigned gx = 0; gx < 16; gx++) {
+				const uint8_t * p = px + (size_t) (f->info.height * (2 * gy + 1) / 18) * f->info.bytesPerRow +
+				    (size_t) (f->info.width * (2 * gx + 1) / 32) * 4;
+				if (p[3] < 8) {
+					clear++;
+				} else if (p[0] < 8 && p[1] < 8 && p[2] < 8) {
+					black++;
+				} else {
+					other++;
+				}
+			}
+		}
+		/* kinds: 0 picture, 1 all transparent, 2 all opaque black, 3 transparent and black only */
+		uint32_t kind = other != 0 ? 0 : black == 0 ? 1 : clear == 0 ? 2 : 3;
+		if ((kind != last_kind || (kind >= 2 && empties++ % 120 == 0)) && said++ < 600) {
+			IOLog("MiniIOMobileFramebuffer: swap %u: frame surface %u: %u clear, %u black, %u else (kind %u); video layer %d\n",
+			    swapWord(swap, SWAP_ID), f->sid, clear, black, other, kind, videoLayer);
+		}
+		last_kind = kind;
+	}
+	uint32_t others = (1u << mainLayer) | (videoLayer >= 0 ? 1u << videoLayer : 0), present = 0;
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		present |= swapWord(swap, SWAP_SURFACE(layer)) != 0 ? 1u << layer : 0;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		alone = alone && ((others >> layer & 1) || swapWord(swap, SWAP_SURFACE(layer)) == 0);
 	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -1656,7 +2099,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 
 		layers |= sid != 0 ? 1u << layer : 0;
 		/* the frames' surfaces: is it a few, in turn? */
-		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
+		for (unsigned i = 0; (int) layer == mainLayer && sid != 0 && i < 8; i++) {
 			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
 				fStatSurfaces[i] = sid;
 				break;
@@ -1664,7 +2107,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
-			if (layer == 0 && (set & 1) && fGraphics) {
+			if (layer == 0 && mainLayer == 0 && (set & 1) && fGraphics) {
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
@@ -1673,7 +2116,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
-		s = layer == 0 && next != NULL ? next : surfaces[layer];
+		if ((int) layer == videoLayer) {
+			memcpy(videoSrc, src, sizeof(src));
+			memcpy(videoDst, dst, sizeof(dst));
+			continue;
+		}
+		s = (int) layer == mainLayer && next != NULL ? next : surfaces[layer];
+		if ((int) layer == mainLayer && s != NULL) {
+			memcpy(mainDst, dst, sizeof(dst));
+			mainW = s->info.width;
+			mainH = s->info.height;
+		}
 		if (report) {
 			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
 			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
@@ -1691,25 +2144,78 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			bool whole = layer == 0 && (set & ~1u) == 0 && fPacked == NULL && src[0] == 0 && src[1] == 0 && src[2] == (int32_t) s->info.width &&
-			    src[3] == (int32_t) s->info.height && dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) fPanelWidth &&
-			    dst[3] == (int32_t) fPanelHeight && s->info.width == fPanelWidth && s->info.height == fPanelHeight;
+			/* (in a 720p mode the swap may name the whole picture in the mode's pixels, 0,0 1280x720: still the whole surface) */
+			bool small = smallOutput() && src[2] == 1280 && src[3] == 720 && dst[2] == 1280 && dst[3] == 720;
+			uint32_t shownW, shownH;
 
-			if (whole && alone && fScanning) {
+			/* (a TV out: the whole frame onto the whole timing, which the VPP scales) */
+			shownSize(fPanelWidth, fPanelHeight, &shownW, &shownH);
+			/* (a layer the swap only clears is no other picture: in HDR modes the window server clears layer 0 in every swap,
+			 * and its frames, read as not whole, were drawn from the swap's surface the GPU never wrote: the boot logo) */
+			bool full = (int) layer == mainLayer && (set & ~others & present) == 0 && fPacked == NULL && src[0] == 0 && src[1] == 0 && dst[0] == 0 && dst[1] == 0 &&
+			    (small || (src[2] == (int32_t) s->info.width && src[3] == (int32_t) s->info.height && dst[2] == (int32_t) shownW &&
+			    dst[3] == (int32_t) shownH));
+			bool whole = full && s->info.width == fPanelWidth && s->info.height == fPanelHeight;
+			/*
+			 * A TV out's swap names window server's scan-out surface of the timing's size (3840x2160 in 2160p), which nothing
+			 * draws in here (backboardd's copy into it is off, tvos/src/twlhook.c): the picture is the frame it drew, flipped
+			 * to the display. That surface is not drawn into the panel (it showed as a solid colour).
+			 */
+			bool tvScanout = gTVOut && full && !whole && s->info.width == shownW && s->info.height == shownH;
+			static uint32_t lastW, lastH, reports;
+			static int32_t lastDst[4];
+
+			if ((int) layer == mainLayer && (s->info.width != lastW || s->info.height != lastH || memcmp(dst, lastDst, sizeof(lastDst)) != 0)) {
+				snprintf(gFramesNow, sizeof(gFramesNow), "%ux%u '%c%c%c%c' from %d,%d %dx%d to %d,%d %dx%d: %s",
+				    s->info.width, s->info.height, (int) (s->info.pixelFormat >> 24 & 0xff), (int) (s->info.pixelFormat >> 16 & 0xff),
+				    (int) (s->info.pixelFormat >> 8 & 0xff), (int) (s->info.pixelFormat & 0xff), src[0], src[1], src[2], src[3],
+				    dst[0], dst[1], dst[2], dst[3], whole ? "scanned" : tvScanout ? "TV scan-out, the flipped frame shown" : "drawn");
+			}
+			if ((int) layer == mainLayer && reports < 40 && (s->info.width != lastW || s->info.height != lastH || memcmp(dst, lastDst, sizeof(lastDst)) != 0)) {
+				reports++;
+				memcpy(lastDst, dst, sizeof(lastDst));
+				IOLog("MiniIOMobileFramebuffer: frames now %ux%u ('%c%c%c%c'), from %d,%d %dx%d to %d,%d %dx%d: %s\n",
+				    s->info.width, s->info.height, (int) (s->info.pixelFormat >> 24 & 0xff), (int) (s->info.pixelFormat >> 16 & 0xff),
+				    (int) (s->info.pixelFormat >> 8 & 0xff), (int) (s->info.pixelFormat & 0xff), src[0], src[1], src[2], src[3],
+				    dst[0], dst[1], dst[2], dst[3], whole ? "scanned as they are" : "drawn into the panel's memory");
+				lastW = s->info.width;
+				lastH = s->info.height;
+			}
+
+			int branch = 0;
+			if (tvScanout && alone) {
+				branch = 1;
+				if (next != NULL && scanFrom(next)) {
+					next = NULL;
+				}
+				scanned = fScanning;
+			} else if (whole && alone && fScanning && (branch = 2)) {
 				/* (the frame goes on the display when the GPU has finished it, and the surface the swap names has not been written) */
 				fStatFlipsKept++;
 				scanned = true;
-			} else if (whole && alone && next != NULL && scanFrom(next)) {
+			} else if (whole && alone && next != NULL && (branch = 3) && scanFrom(next)) {
 				next = NULL;
 				scanned = true;
-			} else if (!(whole && gopOffer(s))) {
+			} else if (!(whole && !small && (branch = 4) && gopOffer(s))) {
+				branch = branch == 4 ? 5 : 6;
 				drawLayer(s, src, dst);
 			}
-			if (layer == 0) {
+			/* kern.hakios_fb_trace=N: the next N swaps' choice (1 TV scan-out, 2 kept, 3 flipped, 4 GPU hand-off,
+			 * 5 hand-off refused then drawn, 6 drawn) and what it rests on */
+			if (gFbTrace > 0 && (int) layer == mainLayer) {
+				gFbTrace--;
+				IOLog("MiniIOMobileFramebuffer: trace swap %u: layer %u surface %u %ux%u src %d,%d %dx%d dst %d,%d %dx%d; set %#x "
+				    "others %#x video %d; full %d whole %d tvScanout %d alone %d small %d; scanning %d next %u; branch %d "
+				    "scanned %d; panel %ux%u shown %ux%u\n", swapWord(swap, SWAP_ID), layer, sid, s->info.width,
+				    s->info.height, src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], set, others, videoLayer,
+				    full, whole, tvScanout, alone, small, fScanning, next ? next->sid : 0, branch, scanned, fPanelWidth,
+				    fPanelHeight, shownW, shownH);
+			}
+			if ((int) layer == mainLayer) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 			/* boot-arg fb_probe=1: is there anything in the surface at all (one pixel in 16 x 16) */
-			if (gProbe && layer == 0 && s->kpixels != NULL && (fSwapsShown < 16 || fSwapsShown % 25 == 0)) {
+			if (gProbe && (int) layer == mainLayer && s->kpixels != NULL && (fSwapsShown < 16 || fSwapsShown % 25 == 0)) {
 				uint32_t nonzero = 0, opaque = 0, samples = 0, first = 0;
 
 				for (uint32_t y = 0; y < s->info.height; y += 16) {
@@ -1728,6 +2234,22 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	/*
+	 * A video layer with no frame over it (the screensaver, IdleScreen, shows its aerial alone): its place is in the
+	 * display's terms all the same, so it is placed against a frame of the whole display (the panel's memory, cleared
+	 * when the bottom layer went, is transparent over the plane). Without this the plane never came on: a black screen.
+	 */
+	if (videoLayer >= 0 && (mainW == 0 || mainH == 0)) {
+		uint32_t w, h;
+
+		shownSize(fPanelWidth, fPanelHeight, &w, &h);
+		mainDst[0] = mainDst[1] = 0;
+		mainDst[2] = (int32_t) w;
+		mainDst[3] = (int32_t) h;
+		mainW = fPanelWidth;
+		mainH = fPanelHeight;
+	}
+	showVideo(swap, videoLayer >= 0 ? surfaces[videoLayer] : NULL, videoSrc, videoDst, mainDst, mainW, mainH);
 	if (fPacked != NULL) {
 		packFrame();
 	}
@@ -2013,8 +2535,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		if (args->scalarOutputCount < 2) {
 			return kIOReturnBadArgument;
 		}
-		out[0] = fOwner->fWidth;
-		out[1] = fOwner->fHeight;
+		{
+			uint32_t w, h;
+
+			shownSize(fOwner->fWidth, fOwner->fHeight, &w, &h);
+			out[0] = w;
+			out[1] = h;
+		}
 		args->scalarOutputCount = 2;
 		return kIOReturnSuccess;
 
@@ -2107,10 +2634,31 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		if (args->scalarInputCount >= 1 && in[0] == 0x40 && args->structureOutputSize >= 12) {
 			/* the current mode: its colour and timing identifiers */
 			uint32_t ids[2] = { kFBColorID, kFBTimingID };
+			unsigned timingID, colorID;
+
+			hakios_hdmitx_current(&timingID, &colorID);
+			if (timingID != 0) {
+				ids[0] = colorID;
+				ids[1] = timingID;
+			}
 
 			memcpy((uint8_t *) args->structureOutput + 4, ids, sizeof(ids));
 		}
 		return kIOReturnSuccess;
+
+	case kFBMethodGetDigitalOutState:               /* out: the state of the digital output (HDMI) */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = gDigitalOutState;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetDigitalOutMode:                /* in: colour element, timing element (Settings > Video and Audio) */
+		if (args->scalarInputCount < 2) {
+			return kIOReturnBadArgument;
+		}
+		return hakios_hdmitx_set_output((unsigned) in[1], (unsigned) in[0]) ? kIOReturnSuccess : kIOReturnUnsupported;
 
 	case kFBMethodGetCurrentAbsoluteTime:
 		if (args->scalarOutputCount < 1) {

@@ -101,7 +101,11 @@ extern void IODelay(unsigned int microseconds);
 
 #define RING_BYTES      (2u << 20)
 #define TICK_MS         5
-#define LEAD_MS         20
+/* how far ahead of the hardware the stream starts (and starts again after an underrun): what a late writer has to spare. 20 ms
+ * was an underrun every couple of seconds with a game busy on all four cores (the audio server writes 512 frames, 10.7 ms, at a
+ * time); boot-arg hdmiaudio_lead_ms. The audio plug-in reports it as the device's latency (TwlAudio, kAudioDevicePropertyLatency). */
+static uint32_t lead_ms = 60;
+#define LEAD_MS         lead_ms
 
 static struct {
 	vm_offset_t aud, ana, clk;
@@ -703,6 +707,10 @@ hakios_hdmiaudio_init(void)
 	int major;
 
 	(void)PE_parse_boot_argn("hdmiaudio_diag", &diag_every, sizeof(diag_every));
+	(void)PE_parse_boot_argn("hdmiaudio_lead_ms", &lead_ms, sizeof(lead_ms));
+	if (lead_ms < 5 || lead_ms > 500) {
+		lead_ms = 60;
+	}
 	if (!PE_parse_boot_argn("hdmiaudio", &level, sizeof(level)) || level == 0) {
 		return;
 	}

@@ -2,7 +2,7 @@
  * HDMI-CEC on the Amlogic box (S905X5M "S7D": the CEC-B controller at 0xfe044000): the TV's own remote as
  * the box's remote. Boot-arg cec=1. The box claims logical address 4 (playback device 1), answers what a TV
  * asks a playback device, and turns <User Control Pressed>/<Released> into key records of /dev/hakios-touch
- * (HID consumer page: Menu Pick/Up/Down/Left/Right, Home, Play/Pause; Back as a keyboard's Escape), the same queue as the USB keys
+ * (HID consumer page: Menu Pick/Up/Down/Left/Right, Home, Play/Pause; Back as Menu Escape), the same queue as the USB keys
  * (hakios.crgudc.c) and backboardd's twilight keys take them (tvos/src/twlinput.inc).
  *
  * Polled from a kernel thread, no interrupt. The programming model is Amlogic's Linux driver
@@ -85,6 +85,9 @@ static struct {
 	uint32_t pending;       /* status bits seen while transmitting, for the receiver */
 	uint32_t held;          /* the key record of the button down now, 0 = none */
 	unsigned frames;
+	bool pa_fixed;          /* boot-arg cec_pa: the EDID's is not taken */
+	volatile bool pa_new;   /* hakios_cec_hotplug(): report the physical address again */
+	volatile int request;   /* hakios_cec_request() */
 } c;
 
 static inline uint32_t
@@ -230,8 +233,9 @@ announce(void)
 }
 
 /*
- * <User Control Pressed> operand -> key record code, (HID usage page << 16) | usage. tvOS's "back" is a
- * keyboard's Escape; the consumer page's Menu is taken for Home.
+ * <User Control Pressed> operand -> key record code, (HID usage page << 16) | usage. tvOS's "back" is the consumer
+ * page's Menu Escape (a keyboard's Escape reached no application once the display is a TV out, kern.fb_external);
+ * the consumer page's Menu is taken for Home.
  */
 static uint32_t
 key_of(uint8_t ui)
@@ -242,7 +246,7 @@ key_of(uint8_t ui)
 	case 0x02: return 0x0c0043;     /* Down */
 	case 0x03: return 0x0c0044;     /* Left */
 	case 0x04: return 0x0c0045;     /* Right */
-	case 0x0d: return 0x070029;     /* Exit (the remote's Back) -> Escape */
+	case 0x0d: return 0x0c0046;     /* Exit (the remote's Back) -> Menu Escape */
 	case 0x09:                      /* Root Menu */
 	case 0x0a:                      /* Setup Menu */
 	case 0x0b: return 0x0c0223;     /* Contents Menu -> AC Home */
@@ -384,6 +388,68 @@ receive(void)
 	}
 }
 
+/*
+ * A TV plugged in again (hakios.hdmitx.c, after reading its EDID): its physical address may be another one (another
+ * input, or none was known at boot because the TV was off). Reported to all, as a device does after a hot plug; the box
+ * does not take the TV's input for that (no <Active Source>): the TV asks if it wants to know.
+ */
+void
+hakios_cec_hotplug(uint32_t physical_address)
+{
+	if (c.ao == 0 || c.pa_fixed || physical_address == 0xffff) {
+		return;
+	}
+	if (physical_address != c.pa) {
+		printf("cec: physical address now %x.%x.%x.%x (from the EDID after a hot plug)\n", physical_address >> 12,
+		    (physical_address >> 8) & 0xf, (physical_address >> 4) & 0xf, physical_address & 0xf);
+	}
+	c.pa = physical_address & 0xffff;
+	c.pa_new = true;
+}
+
+void
+hakios_cec_request(int what)
+{
+	if (c.ao != 0) {
+		c.request = what;
+	}
+}
+
+/* what others asked of the thread (the transmitter is the thread's alone) */
+static void
+requests(void)
+{
+	const uint8_t standby[] = { 0x36 };
+	const uint8_t view_on[] = { 0x04 };
+	uint8_t r[4];
+	int what = c.request;
+
+	if (c.pa_new) {
+		c.pa_new = false;
+		if (c.la != 15) {
+			r[0] = 0x84; r[1] = PHYS_ADDR >> 8; r[2] = PHYS_ADDR & 0xff; r[3] = 4;
+			send(BROADCAST, r, 4);
+		}
+	}
+	if (what == 0) {
+		return;
+	}
+	c.request = 0;
+	if (c.la == 15) {
+		printf("cec: no logical address: request %d dropped\n", what);
+		return;
+	}
+	if (what == HAKIOS_CEC_STANDBY) {
+		printf("cec: <Standby> to all\n");
+		send(BROADCAST, standby, sizeof(standby));
+	} else if (what == HAKIOS_CEC_ONE_TOUCH_PLAY && c.pa != 0xffff) {
+		printf("cec: one touch play\n");
+		send(0, view_on, sizeof(view_on));
+		r[0] = 0x82; r[1] = PHYS_ADDR >> 8; r[2] = PHYS_ADDR & 0xff;
+		send(BROADCAST, r, 3);
+	}
+}
+
 static void
 cec_thread(__unused void *arg, __unused wait_result_t wr_)
 {
@@ -425,6 +491,9 @@ cec_thread(__unused void *arg, __unused wait_result_t wr_)
 		if (st & I_RX_WAKEUP) {
 			cec_wr(CEC_WKUPCTRL, 0x83);
 		}
+		if (c.pa_new || c.request != 0) {
+			requests();
+		}
 		IOSleep(5);
 	}
 }
@@ -443,7 +512,8 @@ hakios_cec_init(void)
 	c.pad = ml_io_map(PAD_BASE, 0x1000);
 	c.la = 15;
 	c.pa = 0xffff;
-	if (!PE_parse_boot_argn("cec_pa", &c.pa, sizeof(c.pa)) && (c.pa = hakios_hdmitx_physical_address()) != 0xffff) {
+	c.pa_fixed = PE_parse_boot_argn("cec_pa", &c.pa, sizeof(c.pa));
+	if (!c.pa_fixed && (c.pa = hakios_hdmitx_physical_address()) != 0xffff) {
 		printf("cec: physical address from the TV's EDID\n");
 	} else if (c.pa == 0xffff) {
 		vm_offset_t sys = ml_io_map(SYSCTRL_STATUS_REG1 & ~0xfffUL, 0x1000);

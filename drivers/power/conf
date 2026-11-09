@@ -24,3 +24,7 @@ driver PMIC
 driver BATTGUARD
 	file    bsd/dev/hakios.battguard.c
 	help    the run handed back to the loader before the battery is flat (battery_stop=<percent>)
+
+standard bsd/dev/hakios.wdt.c
+	help    the Amlogic box's watchdog: armed at boot (wdt=<seconds>, default 20, 0: off) and fed by a kernel thread, so a
+	help    hung box resets itself; 65 s on the way back to the loader (fastboot does not feed it)

@@ -119,10 +119,10 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..7c0e919d593c 100644
+index 44274016a4cf..067e0e0968f1 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,62 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,67 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -134,11 +134,16 @@ index 44274016a4cf..7c0e919d593c 100644
 +bsd/dev/hakios.stubs.c                   standard
 +bsd/dev/hakios.hdmitx.c                  standard
 +bsd/dev/hakios.vdec.c                    standard
++bsd/dev/hakios.hevc.c                    standard
++bsd/dev/hakios.vp9.c                     standard
++bsd/dev/hakios.vp9_prob.c                standard
++bsd/dev/hakios.vplane.c                  standard
 +bsd/dev/hakios.optee.c                   standard
 +bsd/dev/hakios.input.c                   standard
 +bsd/dev/hakios.crgudc.c                  standard
 +bsd/dev/hakios.cec.c                     standard
 +bsd/dev/hakios.net.c                     standard
++bsd/dev/hakios.wdt.c                     standard
 +bsd/dev/hakios.image.c                   standard
 +bsd/dev/hakios.sparse.c                  standard
 +bsd/dev/hakios.apfs_check.c              optional apfs
@@ -185,7 +190,7 @@ index 44274016a4cf..7c0e919d593c 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +211,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +216,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -238,7 +243,7 @@ index 44274016a4cf..7c0e919d593c 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +463,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +468,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -246,7 +251,7 @@ index 44274016a4cf..7c0e919d593c 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +486,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +491,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard

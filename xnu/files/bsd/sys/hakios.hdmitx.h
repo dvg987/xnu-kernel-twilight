@@ -63,6 +63,15 @@ void hakios_hdmitx_audio_show(void);               /* its audio registers, in th
 void hakios_hdmiaudio_init(void);                  /* hakios.hdmiaudio.c, boot-arg hdmiaudio=N: at the end of hakios_hdmitx_init() */
 void hakios_vdec_init(void);                       /* hakios.vdec.c, boot-arg vdec=N: after hakios_hdmiaudio_init() */
 const char *hakios_hdmitx_tv(bool *pq, bool *hlg, bool *bt2020);           /* the TV's name and HDR */
+/* Settings (MiniIOMobileFramebuffer): the current timing/colour IDs, a choice (async mode set), a callback on hot plug and mode set */
+void hakios_hdmitx_current(unsigned *timing_id, unsigned *color_id);
+bool hakios_hdmitx_set_output(unsigned timing_id, unsigned color_id);
+void hakios_hdmitx_set_listener(void (*fn)(void));
+void hakios_hdmitx_osd_source(unsigned w, unsigned h, unsigned stride);  /* what the OSD scans (in the blanking) */
+unsigned hakios_hdmitx_output_height(void);        /* the picture's height on the wire, 0: none */
+uint64_t hakios_hdmitx_frame_ns(void);             /* a frame on the wire in ns, 0: none */
+unsigned hakios_hdmitx_output_width(void);         /* and its width */
+unsigned hakios_hdmitx_color_count(void);          /* colour elements Settings gets (SDR 4, or with HDR10 boot-arg hdmitx_hdrmodes=1) */
 #endif
 
 #endif /* _SYS_HAKIOS_HDMITX_H_ */
