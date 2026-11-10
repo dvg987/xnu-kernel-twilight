@@ -292,6 +292,40 @@ handle(const uint8_t *m, int n)
 	if (n < 2 || (to != c.la && to != BROADCAST)) {
 		return;
 	}
+	if (c.pa == 0xffff && !c.pa_fixed) {
+		/* (an address still unknown -- the first hot plug came before this driver was up: the HDMI driver's EDID's) */
+		c.pa = hakios_hdmitx_physical_address() & 0xffff;
+		if (c.pa != 0xffff) {
+			printf("cec: physical address %x.%x.%x.%x (from the EDID, late)\n", c.pa >> 12, (c.pa >> 8) & 0xf, (c.pa >> 4) & 0xf,
+			    c.pa & 0xf);
+		}
+	}
+	if (hakios_hdmitx_asleep()) {
+		/*
+		 * tvOS asleep (the TV told to stand by, the output off): the TV's remote wakes it, as an Android box wakes --
+		 * a key of it sent to us, the TV switched to our input (Set Stream Path, a routing change or routing
+		 * information ending here). PineBoard is asked to wake the system (a key posted from here did not wake it),
+		 * and its display state (tvos/src/twlpb.c) turns the output on and the TV to this input.
+		 */
+		bool wake = (op == 0x44 && to == c.la) ||
+		    (op == 0x86 && n >= 4 && c.pa != 0xffff && (uint32_t)(m[2] << 8 | m[3]) == PHYS_ADDR) ||
+		    (op == 0x80 && n >= 6 && c.pa != 0xffff && (uint32_t)(m[4] << 8 | m[5]) == PHYS_ADDR) ||
+		    (op == 0x81 && n >= 4 && c.pa != 0xffff && (uint32_t)(m[2] << 8 | m[3]) == PHYS_ADDR);
+
+		if (wake) {
+			printf("cec: %x -> %x: %02x wakes tvOS\n", from, to, op);
+			hakios_hdmitx_request_wake();
+			return;
+		}
+		if (op == 0x85 || op == 0x44 || op == 0x45) {
+			return;                 /* (asleep: not the active source; keys not for us) */
+		}
+		if (op == 0x8f && to == c.la) {
+			r[0] = 0x90; r[1] = 0x01;       /* Report Power Status: standby */
+			send(from, r, 2);
+			return;
+		}
+	}
 	switch (op) {
 	case 0x44:              /* User Control Pressed */
 		if (n > 2) {

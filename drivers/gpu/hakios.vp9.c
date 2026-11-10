@@ -904,6 +904,7 @@ hakios_vp9_frame(struct twl_vp9_frame *f)
 	uint32_t *map = (uint32_t *)(V.pool + MMU_MAP_OFF), pages = (comp_body_size(w, h, depth == 10) + 0xfff) >> 12;
 	/* kept: the references' (to predict from) and the pictures a player or the plane may still show (the plane
 	 * reads the compressed picture) */
+	hakios_vdec_slot_wait(f->slot, V.n_pics);
 	if (f->referenced & (1u << 31)) {
 		uint32_t showing = hakios_vdec_showing(V.n_pics), keep = f->referenced | showing | hakios_vdec_held(V.n_pics);
 		for (uint32_t s = 0; s < V.n_pics; s++) {

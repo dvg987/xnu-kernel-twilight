@@ -9,5 +9,8 @@ driver BT
 standard iokit/Kernel/hakios.btsvc.cpp iokitcpp
 	help    the "bluetooth" service by which Darwin's Bluetooth side finds a controller (the W2's, w2bt=3)
 
+standard bsd/dev/hakios.gamepad.c
+	help    game controllers for programs: the gamepads hakios.hidres.cpp decodes, in sysctl kern.hakios_gamepads
+
 standard iokit/Kernel/hakios.hidres.cpp iokitcpp
 	help    IOHIDResource: HID devices made by programs (BTLEServer's LE remotes), their keys to /dev/hakios-touch

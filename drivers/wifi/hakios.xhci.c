@@ -22,6 +22,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.xhci.h>
 #include <kern/locks.h>
@@ -31,6 +32,7 @@
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void IOSleep(unsigned int milliseconds);
 extern void IODelay(unsigned int microseconds);
@@ -148,7 +150,7 @@ struct ring {
 };
 
 static struct {
-	vm_offset_t blk, regs, clk, rst, pad, trim;
+	vm_offset_t blk, data, regs, clk, rst, pad, trim;
 	uint64_t pa;
 	vm_offset_t op, rt, db;
 	uint32_t ctx_size, ports, step;
@@ -290,11 +292,18 @@ ring_put(struct ring *r, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
 	__builtin_arm_dsb(0xf);
 }
 
+/* how often the event ring is looked at while a transfer is under way: a high-speed transfer is done in tens of
+ * microseconds, and each exchange with the chip is two or three of them */
+static unsigned poll_us = 4;
+SYSCTL_UINT(_kern, OID_AUTO, hakios_xhci_poll_us, CTLFLAG_RW | CTLFLAG_LOCKED, &poll_us, 0, "");
+
 /* the next event, or false after `ms' milliseconds */
 static bool
 next_event(unsigned ms)
 {
-	for (unsigned waited = 0;; waited++) {
+	uint64_t deadline = 0, now;
+
+	for (;;) {
 		volatile uint32_t *e = mem32(OFF_EVENTS + x.ev_idx * 16);
 
 		if ((e[3] & TRB_CYCLE) == x.ev_cycle) {
@@ -308,10 +317,15 @@ next_event(unsigned ms)
 			wr64(x.rt, 0x38, (uint64_t)pa32(OFF_EVENTS + x.ev_idx * 16) | (1u << 3));
 			return true;
 		}
-		if (waited >= ms * 4) {
-			return false;
+		if (deadline == 0) {
+			clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+		} else {
+			clock_get_uptime(&now);
+			if (now > deadline) {
+				return false;
+			}
 		}
-		IODelay(250);
+		IODelay(poll_us);
 	}
 }
 
@@ -702,37 +716,20 @@ w2_write(uint32_t addr, uint32_t value)
 	return bulk(pp->out_dci, pp->out, OFF_CBW, 512, 3000) == 512;
 }
 
-/* between the block (device memory to us: no memcpy, whose wide or unaligned accesses may fault) and memory */
+/* between the block and memory: through its normal non-cacheable view (x.data), where memcpy's wide and unaligned
+ * accesses are allowed and come in bursts; the device view (x.blk) took a bus read for every word */
 static void
 dma_put(uint32_t off, const uint8_t *src, uint32_t n)
 {
-	uint32_t i = 0;
-
-	for (; i + 4 <= n; i += 4) {
-		mem32(off)[i / 4] = src[i] | src[i + 1] << 8 | src[i + 2] << 16 | (uint32_t)src[i + 3] << 24;
-	}
-	for (; i < n; i++) {
-		((volatile uint8_t *)(x.blk + off))[i] = src[i];
-	}
+	memcpy((void *)(x.data + off), src, n);
 	__builtin_arm_dsb(0xf);
 }
 
 static void
 dma_get(uint32_t off, uint8_t *dst, uint32_t n)
 {
-	uint32_t i = 0;
-
-	for (; i + 4 <= n; i += 4) {
-		uint32_t w = mem32(off)[i / 4];
-
-		dst[i] = (uint8_t)w;
-		dst[i + 1] = (uint8_t)(w >> 8);
-		dst[i + 2] = (uint8_t)(w >> 16);
-		dst[i + 3] = (uint8_t)(w >> 24);
-	}
-	for (; i < n; i++) {
-		dst[i] = ((volatile uint8_t *)(x.blk + off))[i];
-	}
+	__builtin_arm_dsb(0xf);
+	memcpy(dst, (const void *)(x.data + off), n);
 }
 
 /* `n' bytes into the chip's memory at `addr', in pieces of 64 KiB: a write-SRAM command, then the data */
@@ -1191,6 +1188,7 @@ hakios_xhci_init(void)
 		return;
 	}
 	x.blk = ml_io_map(x.pa, BLK_SIZE);
+	x.data = ml_io_map_wcomb(x.pa, BLK_SIZE);
 	x.regs = ml_io_map(CRG_BASE, CRG_SIZE);
 	x.clk = ml_io_map(CLK_BASE, 0x1000);
 	x.rst = ml_io_map(RST_BASE, 0x1000);

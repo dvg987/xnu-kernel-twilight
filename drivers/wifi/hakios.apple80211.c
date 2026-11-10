@@ -31,6 +31,7 @@
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
@@ -708,6 +709,40 @@ hakios_apple80211_summary(void)
 	}
 }
 
+/* the last requests, said when the network is left: what the asker looked at before deciding to */
+#define RECENT 48
+static struct { uint64_t ms; int16_t type; uint8_t set; uint8_t error; int32_t value; } recent[RECENT];
+static unsigned recent_next;
+
+static void
+recent_note(const struct apple80211req *request, bool is_set, int error)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	lck_mtx_lock(&apple80211_lock);
+	recent[recent_next++ % RECENT] = (typeof(recent[0])) { ns / NSEC_PER_MSEC, (int16_t)request->req_type, is_set,
+		                                               (uint8_t)error, request->req_val };
+	lck_mtx_unlock(&apple80211_lock);
+}
+
+static void
+recent_say(const char *who)
+{
+	uint64_t now;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	now /= NSEC_PER_MSEC;
+	printf("apple80211: %s leaves the network; its last requests:\n", who);
+	lck_mtx_lock(&apple80211_lock);
+	for (unsigned i = recent_next > RECENT ? recent_next - RECENT : 0; i < recent_next; i++) {
+		typeof(recent[0]) r = recent[i % RECENT];
+		printf("apple80211:   -%llu ms %s %d (%s) value %d%s\n", now - r.ms, r.set ? "set" : "get", r.type, type_name(r.type), r.value,
+		    r.error == 0 ? "" : r.error == EOPNOTSUPP ? " REFUSED" : " error");
+	}
+	lck_mtx_unlock(&apple80211_lock);
+}
+
 /* An Apple80211 request for the radio's interface, from the process that is running now. */
 errno_t
 hakios_apple80211_ioctl(u_long command, void *data)
@@ -722,10 +757,14 @@ hakios_apple80211_ioctl(u_long command, void *data)
 		return EOPNOTSUPP;
 	}
 	proc_selfname(who, sizeof(who));
+	if (is_set && request->req_type == 22) {
+		recent_say(who);
+	}
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
 	note(request, is_set, error);
-	/* (a request that is repeated for ever is said a few hundred times) */
-	if (said < 800) {
+	recent_note(request, is_set, error);
+	/* (a request that is repeated for ever is said a few hundred times; a set always: they are few) */
+	if (said < 800 || is_set) {
 		said++;
 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==

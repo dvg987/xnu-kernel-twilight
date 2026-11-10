@@ -14,6 +14,7 @@ void hakios_hevc_reset_core(void);
 bool hakios_vdec_pool(vm_offset_t *va, uint64_t *pa, uint32_t *size);
 uint32_t hakios_vdec_showing(unsigned slots);           /* hakios.vdec.c: slots the plane reads */
 uint32_t hakios_hevc_transfer(void);                     /* hakios.hevc.c: the VUI's transfer characteristics, 0: none */
+void hakios_vdec_slot_wait(unsigned slot, unsigned slots);    /* hakios.vdec.c: until the plane lets the slot go */
 uint32_t hakios_vdec_irq_seq(void);                      /* hakios.vdec.c: the core's interrupt, before a look */
 bool hakios_vdec_irq_nap(uint32_t seq, unsigned us);    /* sleep until the next one (or us); false without it */
 uint32_t hakios_vdec_held(unsigned slots);              /* slots a player or the plane may still show */

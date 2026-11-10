@@ -8,6 +8,7 @@
 struct hakios_gl;
 
 struct hakios_gl *hakios_gl_create(int version);              /* a context of OpenGL ES 2 or 3; NULL: none to be had */
+struct hakios_gl *hakios_gl_create_shared(int version, struct hakios_gl *share);    /* ... sharing share's objects */
 int hakios_gl_make_current(struct hakios_gl *gl);             /* ... the calling thread's (NULL: none); 0 on failure */
 void hakios_gl_destroy(struct hakios_gl *gl);
 const char *hakios_gl_library(void);                           /* for the log */

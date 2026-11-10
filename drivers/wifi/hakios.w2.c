@@ -26,6 +26,7 @@
 #include <sys/errno.h>
 #include <sys/random.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/kpi_mbuf.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.sta.h>
@@ -34,6 +35,7 @@
 #include "../../../../wifi/lx/src/lx_wpa.h"
 
 extern void IOSleep(unsigned int milliseconds);
+extern void IODelay(unsigned int microseconds);
 
 /* the chip's memory */
 #define A2E_MSG         0x60000014u
@@ -48,6 +50,16 @@ extern void IOSleep(unsigned int milliseconds);
 #define RX_START        0x6001b400u
 #define RX_END_EXPAND   0x600684b0u
 #define RX_END_NARROW   0x60029130u
+#define REO_SLOTS       256                 /* a receive block ack's frames at most */
+#define PAGES_EXPAND    21                  /* TX pages with each layout */
+#define PAGES_NARROW    77
+/* the RX head's layout requests and our answers to them, with the tail we confirm (aml_sdio_usb_rx.c) */
+#define FW_NARROW       (1u << 20)
+#define FW_EXPAND       (1u << 21)
+#define EXPAND_READ     (1u << 25)
+#define EXPAND_DONE     (1u << 26)
+#define NARROW_READ     (1u << 27)
+#define NARROW_DONE     (1u << 28)
 #define RX_FIRST_TAIL   0x60b081d0u
 #define RX_CONFIRM      0x00a10038u
 #define CHAN_SWITCH     0x00a17fc0u
@@ -87,12 +99,11 @@ extern void IOSleep(unsigned int milliseconds);
 #define SUB_EXT_CAPAB           35
 
 #define N_BSS           48
-#define N_SLOTS         64                  /* TX frames outstanding at most */
+#define N_SLOTS         128                 /* TX frames outstanding at most (the narrow layout has 77 pages) */
 #define PAGE_MOST       4624
 
 static LCK_GRP_DECLARE(w2_lck_grp, "hakios-w2");
 static LCK_MTX_DECLARE(w2_lock, &w2_lck_grp);
-static LCK_MTX_DECLARE(frame_lock, &w2_lck_grp);       /* en0's frame being copied out of its mbufs */
 
 static struct {
 	unsigned step;
@@ -109,14 +120,28 @@ static struct {
 	uint32_t tail, end;                 /* chip addresses, BIT31 the phase */
 	bool tail_known;
 	unsigned rx_frames, rx_dropped;
+	/* receive reordering, by TID */
+	struct reo {
+		bool on;
+		unsigned ssn, size, held;
+		struct reo_slot {
+			uint8_t *data;
+			uint16_t length, flags;
+			uint64_t deadline;
+		} slot[REO_SLOTS];
+	} reo[8];
+	unsigned reo_waited, reo_timeouts, reo_stale;
+	uint64_t rx_bytes;
+	unsigned rx_batches, polls;
 	/* frames out */
 	int pages;
 	uint32_t slot_id[N_SLOTS], prefix;
 	bool slot_busy[N_SLOTS];
 	unsigned cfm_index;
-	unsigned tx_frames, tx_dropped;
-	bool tx_stopped;
-	uint8_t page[PAGE_MOST];
+	unsigned tx_frames, tx_dropped, tx_batches;
+	bool tx_stopped, stop_pending;       /* stop asked for; told the firmware once all pages are back */
+	int pages_total;
+	uint32_t layout_flags, confirmed;   /* our answer to a layout change; the last confirmation written */
 	/* the station */
 	struct hakios_sta_bss *bss;         /* N_BSS */
 	uint64_t bss_heard[N_BSS];
@@ -134,6 +159,13 @@ static struct {
 	unsigned eapol;
 	uint8_t rsn[22];
 } w;
+
+/* the poll thread's pause between looks at the chip: when the last look found nothing (ms), and after one that
+ * moved frames (us, 0: straight on); kern.hakios_w2_stats=1 logs the traffic every 2 s */
+static unsigned idle_ms = 1, busy_us = 0, stats;
+SYSCTL_UINT(_kern, OID_AUTO, hakios_w2_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &idle_ms, 0, "");
+SYSCTL_UINT(_kern, OID_AUTO, hakios_w2_busy_us, CTLFLAG_RW | CTLFLAG_LOCKED, &busy_us, 0, "");
+SYSCTL_UINT(_kern, OID_AUTO, hakios_w2_stats, CTLFLAG_RW | CTLFLAG_LOCKED, &stats, 0, "");
 
 static inline uint16_t le16(const uint8_t *p) { return p[0] | p[1] << 8; }
 static inline uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -343,6 +375,144 @@ bss_heard(const uint8_t *f, unsigned length, unsigned freq, int rssi)
 	lck_mtx_unlock(&w2_lock);
 }
 
+static void mpdu_received(const uint8_t *frame, unsigned frmlen, unsigned flags);
+
+/*
+ * Receive reordering (aml_reorder.c, simpler): a session for each TID the firmware has agreed a receive block ack for
+ * (MM_BA_ADD_REQ forwarded); frames from the window's start on go up in order, the others wait in their sequence
+ * number's place until the gap before them fills, the window moves past them (a later frame, a BlockAckReq), or
+ * REO_WAIT_MS passes.
+ */
+#define REO_WAIT_MS     100
+
+static inline bool sn_less(unsigned a, unsigned b) { return ((a - b) & 0xfff) > 2048; }
+
+static void
+reo_release(unsigned tid, unsigned index)
+{
+	struct reo_slot *e = &w.reo[tid].slot[index];
+
+	mpdu_received(e->data, e->length, e->flags);
+	kfree_data(e->data, e->length);
+	e->data = NULL;
+	w.reo[tid].held--;
+}
+
+/* the window's start to `ssn' (the frames before it go up, holes are given up on), then on past what is there */
+static void
+reo_shift(unsigned tid, unsigned ssn)
+{
+	struct reo *r = &w.reo[tid];
+	unsigned sn = r->ssn;
+
+	for (;; sn = (sn + 1) & 0xfff) {
+		unsigned index = sn % REO_SLOTS;
+
+		if (r->slot[index].data != NULL) {
+			reo_release(tid, index);
+		} else if (!sn_less(sn, ssn)) {
+			break;
+		}
+	}
+	r->ssn = sn;
+}
+
+static void
+reo_add(unsigned tid, unsigned sn, const uint8_t *frame, unsigned length, unsigned flags)
+{
+	struct reo *r = &w.reo[tid];
+	unsigned index = sn % REO_SLOTS;
+
+	if (sn_less(sn, r->ssn)) {
+		w.reo_stale++;                          /* before the window: a duplicate, or given up on already */
+		return;
+	}
+	if (!sn_less(sn, (r->ssn + r->size) & 0xfff)) {
+		reo_shift(tid, (sn - r->size + 1) & 0xfff);
+	}
+	if (r->slot[index].data != NULL) {
+		return;                                 /* a duplicate */
+	}
+	if (sn == r->ssn) {
+		mpdu_received(frame, length, flags);
+		reo_shift(tid, (sn + 1) & 0xfff);
+		return;
+	}
+	r->slot[index].data = kalloc_data(length, Z_NOWAIT);
+	if (r->slot[index].data == NULL) {
+		mpdu_received(frame, length, flags);
+		return;
+	}
+	memcpy(r->slot[index].data, frame, length);
+	r->slot[index].length = (uint16_t)length;
+	r->slot[index].flags = (uint16_t)flags;
+	r->slot[index].deadline = now_ms() + REO_WAIT_MS;
+	r->held++;
+	w.reo_waited++;
+}
+
+/* a BlockAckReq: the sender will not send what is before `ssn' again */
+static void
+reo_bar(unsigned tid, unsigned ssn)
+{
+	if (w.reo[tid].on && sn_less(w.reo[tid].ssn, ssn)) {
+		reo_shift(tid, ssn);
+	}
+}
+
+/* frames waited for too long: the holes before the last of them are given up on */
+static void
+reo_age(void)
+{
+	uint64_t now = now_ms();
+
+	for (unsigned tid = 0; tid < 8; tid++) {
+		struct reo *r = &w.reo[tid];
+		int last = -1;
+
+		if (!r->on || r->held == 0) {
+			continue;
+		}
+		for (unsigned i = 0; i < r->size; i++) {
+			unsigned sn = (r->ssn + i) & 0xfff;
+			struct reo_slot *e = &r->slot[sn % REO_SLOTS];
+
+			if (e->data != NULL && e->deadline <= now) {
+				last = (int)sn;
+			}
+		}
+		if (last >= 0) {
+			w.reo_timeouts++;
+			reo_shift(tid, ((unsigned)last + 1) & 0xfff);
+		}
+	}
+}
+
+static void
+reo_start(unsigned tid, unsigned size, unsigned ssn)
+{
+	struct reo *r = &w.reo[tid & 7];
+
+	if (r->on) {
+		reo_shift(tid & 7, (r->ssn + REO_SLOTS) & 0xfff);   /* (all of the old session's frames up) */
+	}
+	r->on = true;
+	r->size = size == 0 || size > REO_SLOTS ? REO_SLOTS : size;
+	r->ssn = ssn & 0xfff;
+	printf("w2: receive block ack: tid %u, %u frames, from %u\n", tid & 7, r->size, r->ssn);
+}
+
+static void
+reo_stop(unsigned tid)
+{
+	struct reo *r = &w.reo[tid & 7];
+
+	if (r->on) {
+		reo_shift(tid & 7, (r->ssn + REO_SLOTS) & 0xfff);
+		r->on = false;
+	}
+}
+
 /* one record of the RX ring: a descriptor and a frame */
 static void
 rx_record(const uint8_t *d, unsigned length)
@@ -370,14 +540,35 @@ rx_record(const uint8_t *d, unsigned length)
 		return;
 	}
 	frame = d + p;
-	if (flags & 2) {                                        /* an 802.11 frame: management */
+	if (flags & 2) {                                        /* an 802.11 frame: management (or a block ack request) */
 		unsigned subtype = frame[0] & 0xfc;
 
 		if (w.scanning && (subtype == 0x80 || subtype == 0x50)) {
 			bss_heard(frame, frmlen, le16(d + 90), (int8_t)d[65]);
 		}
+		if (frame[0] == 0x84 && frmlen >= 20) {        /* BlockAckReq: the sender moved its window on */
+			reo_bar((le16(frame + 16) >> 12) & 7, le16(frame + 18) >> 4);
+		}
 		return;
 	}
+	/* under a receive block ack session the frames come in the order they were received in, not sent in: the host
+	 * puts them back in order (aml_reorder.c); the sequence number in the extension before the frame */
+	if (status == 0x06 && payl >= 4) {
+		const uint8_t *ext = d + 128 + 36;
+		unsigned tid = (flags >> 4) & 7;
+
+		if ((le16(ext + 2) & (1u << 14)) && w.reo[tid].on) {
+			reo_add(tid, le16(ext) & 0xfff, frame, frmlen, flags);
+			return;
+		}
+	}
+	mpdu_received(frame, frmlen, flags);
+}
+
+/* a frame (an Ethernet II frame, or an A-MSDU's subframes) to the stack */
+static void
+mpdu_received(const uint8_t *frame, unsigned frmlen, unsigned flags)
+{
 	if (flags & 1) {                                        /* A-MSDU: subframes {DA, SA, length, LLC/SNAP + body} */
 		uint8_t eth[HAKIOS_NET_FRAME_MAX];
 
@@ -404,40 +595,100 @@ ring_at(uint32_t addr)
 	return w.ring + ((addr & 0x7fffffffu) - RX_START);
 }
 
-/* the ring from the tail up to the head the firmware gave */
+/*
+ * Tells the firmware where we got to, with our part of a change of the buffers' layout (aml_sdio_usb_rx_confirm):
+ * the firmware stops RX and sets NARROW (more TX pages, a smaller ring) or EXPAND (the other way) in the head; once the
+ * ring is drained the new layout applies here and READ answers; when the firmware clears its flag, DONE.
+ */
 static void
+rx_confirm(uint32_t state, uint32_t head)
+{
+	uint32_t flags = 0, value;
+	uint8_t c[8];
+
+	switch (state | w.layout_flags) {
+	case FW_NARROW:
+		/* drained: the firmware's pointer back at the start if the smaller ring no longer holds it */
+		if ((head & 0x7fffffffu) >= RX_END_NARROW) {
+			w.tail = RX_START;
+		}
+		w.end = RX_END_NARROW;
+		flags = NARROW_READ;
+		break;
+	case FW_EXPAND:
+		w.end = RX_END_EXPAND;
+		flags = EXPAND_READ;
+		break;
+	case FW_NARROW | NARROW_READ:
+	case FW_EXPAND | EXPAND_READ:
+		flags = w.layout_flags;                         /* (the firmware has not cleared its flag yet) */
+		break;
+	case NARROW_READ:
+		flags = NARROW_DONE;
+		break;
+	case EXPAND_READ:
+		flags = EXPAND_DONE;
+		break;
+	case 0:
+		break;
+	default:
+		printf("w2: rx ring: layout state %#x with our flags %#x\n", state, w.layout_flags);
+		break;
+	}
+	if (flags == NARROW_READ || flags == EXPAND_READ) {
+		/* the TX pages of the new layout: TX is stopped and every page is back. (The head can still carry the
+		 * request after the change is done: answered again, but the pages are not counted again.) */
+		int total = flags == NARROW_READ ? PAGES_NARROW : PAGES_EXPAND;
+
+		lck_mtx_lock(&w2_lock);
+		if (w.pages_total != total) {
+			w.pages += total - w.pages_total;
+			w.pages_total = total;
+			printf("w2: buffers: %s RX ring, %d TX pages\n", flags == NARROW_READ ? "the small" : "the large", total);
+		}
+		lck_mtx_unlock(&w2_lock);
+	}
+	w.layout_flags = (flags == NARROW_DONE || flags == EXPAND_DONE) ? 0 : flags;
+	value = flags | w.tail;
+	if (value == w.confirmed) {
+		return;
+	}
+	w.confirmed = value;
+	put32(c, 1);
+	put32(c + 4, value);
+	hakios_w2_sram_write(RX_CONFIRM, c, 8);
+}
+
+/* the ring from the tail up to the head the firmware gave; the records taken */
+static unsigned
 rx_process(uint32_t r)
 {
-	uint32_t head, cur, a, b;
+	uint32_t head, cur, a, b, state;
 	unsigned records = 0;
 
 	if (r == 0) {
-		return;
+		return 0;
 	}
 	head = 0x60000000u | (r & ~(7u << 19) & 0x0fffffffu);
 	if (r & (1u << 19)) {
 		head |= 1u << 31;
 	}
-	if ((r & (3u << 20)) && records == 0) {
-		static bool told;
-
-		if (!told) {
-			printf("w2: the firmware asks for a buffer layout change (%#x): not done here\n", r);
-			told = true;
-		}
-	}
+	state = r & (FW_NARROW | FW_EXPAND);
 	if (!w.tail_known) {
 		uint8_t t[4];
 
 		if (!hakios_w2_sram_read(RX_FIRST_TAIL, t, 4)) {
-			return;
+			return 0;
 		}
 		w.tail = le32(t);
 		w.tail_known = true;
 		printf("w2: rx ring: tail %#x, head %#x\n", w.tail, head);
 	}
 	if (w.tail == head) {
-		return;
+		if (state != 0 || w.layout_flags != 0) {
+			rx_confirm(state, head);
+		}
+		return 0;
 	}
 	/* read what is new into the copy of the ring */
 	a = w.tail & 0x7fffffffu;
@@ -445,16 +696,16 @@ rx_process(uint32_t r)
 	if (a < RX_START || a >= w.end || b < RX_START || b >= w.end) {
 		printf("w2: rx ring: tail %#x or head %#x outside it; starting again at the head\n", w.tail, head);
 		w.tail = head;
-		return;
+		return 0;
 	}
 	if ((w.tail >> 31) == (head >> 31) && a < b) {
 		if (!hakios_w2_sram_read(a, ring_at(a), b - a)) {
-			return;
+			return 0;
 		}
 	} else {
 		if (!hakios_w2_sram_read(a, ring_at(a), w.end - a) || (b > RX_START &&
 		    !hakios_w2_sram_read(RX_START, ring_at(RX_START), b - RX_START))) {
-			return;
+			return 0;
 		}
 	}
 	/* and walk its records */
@@ -503,33 +754,44 @@ rx_process(uint32_t r)
 		records++;
 	}
 	w.tail = head;
-	{
-		uint8_t c[8];
-
-		put32(c, 1);
-		put32(c + 4, w.tail);
-		hakios_w2_sram_write(RX_CONFIRM, c, 8);
-	}
+	rx_confirm(state, head);
+	w.rx_bytes += b > a ? b - a : (w.end - a) + (b - RX_START);
+	w.rx_batches++;
+	return records;
 }
 
 /* ---- frames out ---- */
 
 /*
- * One Ethernet frame to send: a page (txdesc_host, then the frame without its Ethernet header). `special': a frame of
- * the handshake (or one the firmware should send as soon as it can).
+ * Frames to send go into a batch (a page each: txdesc_host, then the frame without its Ethernet header) that the TX
+ * thread sends with one packet command, up to 25 pages and 64 KiB: one exchange on the bus for many frames (a TCP
+ * stream's acknowledgements, a stream sent). Two batches: one filled while the other goes out.
  */
+#define BATCH_PAGES     25
+#define BATCH_BYTES     0x10000
+
+struct batch {
+	uint8_t *data;
+	uint32_t used;
+	unsigned count;
+	uint16_t sizes[BATCH_PAGES];
+	uint16_t slots[BATCH_PAGES];
+};
+static struct batch batches[2];
+static unsigned filling;                /* the batch frames go into (w2_lock) */
+
+/* `special': a frame of the handshake (or one the firmware should send as soon as it can) */
 static bool
 transmit_frame(const uint8_t *frame, size_t length, bool special)
 {
-	uint8_t *pg = w.page;
 	unsigned slot, tid, payload = (unsigned)length - 14, size = (72 + payload + 3) & ~3u;
-	uint16_t sizes[1];
 	uint16_t type;
 	uint64_t began = now_ms();
-	bool ok;
+	struct batch *b;
+	uint8_t *pg;
 	static const uint8_t ac_of_tid[8] = { 1, 0, 0, 1, 2, 2, 3, 3 };
 
-	if (length < 14 || size > PAGE_MOST) {
+	if (length < 14 || size > PAGE_MOST || batches[0].data == NULL) {
 		return false;
 	}
 	type = (uint16_t)(frame[12] << 8 | frame[13]);
@@ -537,7 +799,8 @@ transmit_frame(const uint8_t *frame, size_t length, bool special)
 	for (;;) {
 		for (slot = 0; slot < N_SLOTS && w.slot_busy[slot]; slot++) {
 		}
-		if (slot < N_SLOTS && w.pages > 1 && !w.tx_stopped) {
+		b = &batches[filling];
+		if (slot < N_SLOTS && w.pages > 1 && !w.tx_stopped && b->count < BATCH_PAGES && b->used + size <= BATCH_BYTES) {
 			break;
 		}
 		if (now_ms() - began > 100) {
@@ -549,6 +812,7 @@ transmit_frame(const uint8_t *frame, size_t length, bool special)
 	}
 	w.slot_busy[slot] = true;
 	w.pages--;
+	pg = b->data + b->used;
 	bzero(pg, 72);
 	put32(pg + 0, w.slot_id[slot]);
 	put32(pg + 4, 1);                                       /* packet_addr[0]: 1 on USB */
@@ -567,33 +831,58 @@ transmit_frame(const uint8_t *frame, size_t length, bool special)
 	put32(pg + 68, 0xffffffffu);
 	memcpy(pg + 72, frame + 14, payload);
 	bzero(pg + 72 + payload, size - 72 - payload);
-	sizes[0] = (uint16_t)size;
-	ok = hakios_w2_packets(pg, sizes, 1);
-	if (ok) {
-		w.tx_frames++;
-	} else {
-		w.slot_busy[slot] = false;
-		w.pages++;
-		w.tx_dropped++;
-	}
+	b->sizes[b->count] = (uint16_t)size;
+	b->slots[b->count] = (uint16_t)slot;
+	b->count++;
+	b->used += size;
+	thread_wakeup((event_t)&filling);
 	lck_mtx_unlock(&w2_lock);
-	return ok;
+	return true;
+}
+
+/* the TX thread: each batch out as it fills, the other filling meanwhile */
+static void
+tx_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	lck_mtx_lock(&w2_lock);
+	for (;;) {
+		struct batch *b = &batches[filling];
+		bool ok;
+
+		if (b->count == 0) {
+			lck_mtx_sleep(&w2_lock, LCK_SLEEP_DEFAULT, (event_t)&filling, THREAD_UNINT);
+			continue;
+		}
+		filling ^= 1;
+		lck_mtx_unlock(&w2_lock);
+		ok = hakios_w2_packets(b->data, b->sizes, b->count);
+		lck_mtx_lock(&w2_lock);
+		if (ok) {
+			w.tx_frames += b->count;
+			w.tx_batches++;
+		} else {
+			for (unsigned i = 0; i < b->count; i++) {
+				w.slot_busy[b->slots[i]] = false;
+				w.pages++;
+			}
+			w.tx_dropped += b->count;
+		}
+		b->count = 0;
+		b->used = 0;
+		thread_wakeup((event_t)&w.pages);
+	}
 }
 
 /* en0's frames to send */
 static bool
 link_transmit(mbuf_t packet, size_t length)
 {
-	static uint8_t frame[HAKIOS_NET_FRAME_MAX];
-	bool ok;
+	uint8_t frame[HAKIOS_NET_FRAME_MAX];
 
 	if (!w.joined || length > sizeof(frame)) {
 		return false;
 	}
-	lck_mtx_lock(&frame_lock);
-	ok = mbuf_copydata(packet, 0, length, frame) == 0 && transmit_frame(frame, length, false);
-	lck_mtx_unlock(&frame_lock);
-	return ok;
+	return mbuf_copydata(packet, 0, length, frame) == 0 && transmit_frame(frame, length, false);
 }
 
 /* the ring of confirmations: each one of ours gives a page back */
@@ -677,6 +966,9 @@ message_received(const uint8_t *m)
 		    p[12], le16(p + 18) & 0x3fff);
 		break;
 	case SM_DISCONNECT_IND:
+		for (unsigned tid = 0; tid < 8; tid++) {
+			reo_stop(tid);
+		}
 		printf("w2: disconnected (reason %u%s%s)\n", le16(p) & 0x7fff, (le16(p) & 0x8000) ? ", asked by us" : "",
 		    p[3] ? ", reassociating" : "");
 		if (!p[3] && w.joined) {
@@ -699,8 +991,18 @@ message_received(const uint8_t *m)
 	case DBG_ERROR_IND:
 		printf("w2: the firmware reports an error\n");
 		break;
+	case 0x0028:                                            /* MM_BA_ADD_REQ, forwarded: type, sta, tid, size, ssn */
+		if (length >= 6 && p[0] == 1) {
+			reo_start(p[2], p[3], le16(p + 4));
+		}
+		break;
+	case 0x002a:                                            /* MM_BA_DEL_REQ: type, sta, tid */
+		if (length >= 3 && p[0] == 1) {
+			reo_stop(p[2]);
+		}
+		break;
 	case MM_CHANNEL_SWITCH_IND:
-	case 0x0028: case 0x0029: case 0x002a: case 0x002b:   /* block ack sessions: no reordering here */
+	case 0x0029: case 0x002b:
 	case 0x004f:                                            /* a channel's survey, during a scan */
 	case 0x4019:
 		break;
@@ -746,6 +1048,26 @@ debug_string(void)
 	hakios_w2_write(IPC_TRIGGER, 0x1);
 }
 
+/* TX stopped at the firmware's request (to change the buffers' layout): tell it so once all our frames are sent */
+static void
+tx_stop_check(void)
+{
+	bool tell;
+	uint8_t c[8];
+
+	lck_mtx_lock(&w2_lock);
+	tell = w.stop_pending && w.pages >= w.pages_total;
+	if (tell) {
+		w.stop_pending = false;
+	}
+	lck_mtx_unlock(&w2_lock);
+	if (tell) {
+		put32(c, 3);                            /* DYNAMIC_BUF_NOTIFY_FW_TX_STOP */
+		put32(c + 4, 1);
+		hakios_w2_sram_write(EXT_IRQ, c, 8);
+	}
+}
+
 static void
 extended(void)
 {
@@ -757,18 +1079,13 @@ extended(void)
 	lck_mtx_lock(&w2_lock);
 	if (v == 1) {
 		w.tx_stopped = true;
+		w.stop_pending = true;                  /* told once every page is back: tx_stop_check */
 	} else if (v == 2) {
 		w.tx_stopped = false;
 		thread_wakeup((event_t)&w.pages);
 	}
 	lck_mtx_unlock(&w2_lock);
-	if (v == 1) {
-		uint8_t c[8];
-
-		put32(c, 3);
-		put32(c + 4, 1);
-		hakios_w2_sram_write(EXT_IRQ, c, 8);
-	}
+	tx_stop_check();
 	printf("w2: extended interrupt %u%s\n", v, v == 1 ? " (stop sending)" : v == 2 ? " (send again)" : v == 7 ?
 	    " (the firmware crashed)" : "");
 }
@@ -1352,12 +1669,18 @@ hakios_w2_run(unsigned step)
 
 	w.step = step;
 	w.end = RX_END_EXPAND;
-	w.pages = 21;
+	w.pages = w.pages_total = PAGES_EXPAND;
 	w.prefix = 521;
 	for (unsigned i = 0; i < N_SLOTS; i++) {
 		w.slot_id[i] = ((i + 1) << 16 | (i + 1)) & 0x3ffffff;
 	}
 	w.ring = kalloc_data(RX_END_EXPAND - RX_START, Z_WAITOK | Z_ZERO);
+	batches[0].data = kalloc_data(BATCH_BYTES, Z_WAITOK);
+	batches[1].data = kalloc_data(BATCH_BYTES, Z_WAITOK);
+	if (batches[0].data == NULL || batches[1].data == NULL) {
+		printf("w2: no memory\n");
+		return;
+	}
 	w.bss = kalloc_data(N_BSS * sizeof(*w.bss), Z_WAITOK | Z_ZERO);
 	if (w.ring == NULL || w.bss == NULL) {
 		printf("w2: no memory\n");
@@ -1376,9 +1699,33 @@ hakios_w2_run(unsigned step)
 		thread_set_thread_name(thread, "w2 work");
 		thread_deallocate(thread);
 	}
+	if (kernel_thread_start(tx_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "w2 tx");
+		thread_deallocate(thread);
+	}
+	uint64_t stats_at = now_ms();
 	for (;;) {
 		uint32_t words[4];
 		uint32_t st;
+		bool busy = false;
+
+		w.polls++;
+		if (stats && now_ms() - stats_at >= 2000) {
+			uint64_t ms = now_ms() - stats_at;
+			static unsigned rx_frames0, tx_frames0;
+
+			printf("w2: %u ms: %u polls, rx %llu bytes (%llu Mbit/s) in %u batches, %u frames (%u dropped; reordered %u, "
+			    "timed out %u, stale %u); tx %u frames in %u batches (%u dropped), %d pages free\n", (unsigned)ms, w.polls,
+			    w.rx_bytes, w.rx_bytes * 8 / 1000 / ms, w.rx_batches, w.rx_frames - rx_frames0, w.rx_dropped, w.reo_waited,
+			    w.reo_timeouts, w.reo_stale, w.tx_frames - tx_frames0, w.tx_batches, w.tx_dropped, w.pages);
+			w.reo_waited = w.reo_timeouts = w.reo_stale = 0;
+			w.tx_batches = 0;
+			rx_frames0 = w.rx_frames;
+			tx_frames0 = w.tx_frames;
+			w.polls = w.rx_batches = 0;
+			w.rx_bytes = 0;
+			stats_at = now_ms();
+		}
 
 		if (!hakios_w2_irq(words)) {
 			if (++failures == 10) {
@@ -1403,10 +1750,19 @@ hakios_w2_run(unsigned step)
 		if (st & ST_EXT) {
 			extended();
 		}
-		rx_process(words[0]);
+		busy = rx_process(words[0]) != 0;
+		reo_age();
 		if (st & ST_TXCFM) {
 			tx_confirmations();
+			busy = true;
 		}
-		IOSleep(1);
+		if (w.stop_pending) {
+			tx_stop_check();
+		}
+		if (!busy) {
+			IOSleep(idle_ms);
+		} else if (busy_us) {
+			IODelay(busy_us);
+		}
 	}
 }

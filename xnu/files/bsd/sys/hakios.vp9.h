@@ -12,6 +12,7 @@ void hakios_vp9_cancel(void);
 bool hakios_vp9_active(void);
 bool hakios_vp9_shown(void);
 uint32_t hakios_vdec_showing(unsigned slots);           /* hakios.vdec.c: slots the plane reads */
+void hakios_vdec_slot_wait(unsigned slot, unsigned slots);    /* hakios.vdec.c: until the plane lets the slot go */
 uint32_t hakios_vdec_irq_seq(void);                      /* hakios.vdec.c: the core's interrupt, before a look */
 bool hakios_vdec_irq_nap(uint32_t seq, unsigned us);    /* sleep until the next one (or us); false without it */
 uint32_t hakios_vdec_held(unsigned slots);              /* hakios.vdec.c: slots a player or the plane may still show */                            /* the frame just decoded is one to show */

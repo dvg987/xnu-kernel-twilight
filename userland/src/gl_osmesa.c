@@ -57,6 +57,13 @@ struct hakios_gl {
 struct hakios_gl *
 hakios_gl_create(int version)
 {
+	return hakios_gl_create_shared(version, NULL);
+}
+
+/* a context that shares textures, buffers and programs with `share` (EAGLSharegroup); NULL: none */
+struct hakios_gl *
+hakios_gl_create_shared(int version, struct hakios_gl *share)
+{
 	const int attributes[] = {
 		OSMESA_FORMAT, OSMESA_RGBA, OSMESA_DEPTH_BITS, 24, OSMESA_STENCIL_BITS, 8,
 		OSMESA_PROFILE, OSMESA_ES_PROFILE, OSMESA_CONTEXT_MAJOR_VERSION, version, OSMESA_CONTEXT_MINOR_VERSION, 0,
@@ -64,7 +71,7 @@ hakios_gl_create(int version)
 	};
 	struct hakios_gl *gl = calloc(1, sizeof(*gl));
 
-	if (gl != NULL && (gl->context = OSMesaCreateContextAttribs(attributes, NULL)) == NULL) {
+	if (gl != NULL && (gl->context = OSMesaCreateContextAttribs(attributes, share ? share->context : NULL)) == NULL) {
 		free(gl);
 		gl = NULL;
 	}

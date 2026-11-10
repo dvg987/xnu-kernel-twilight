@@ -42,6 +42,7 @@ extern void IODelay(unsigned int microseconds);
 extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
 extern void thread_deallocate(thread_t thread);
 extern uint64_t hakios_hdmitx_frame_ns(void);
+extern void hakios_vdec_plane_vsync(void);
 extern wait_result_t assert_wait_deadline(event_t event, wait_interrupt_t interruptible, uint64_t deadline);
 extern wait_result_t thread_block(thread_continue_t continuation);
 extern kern_return_t thread_wakeup_prim(event_t event, boolean_t one_thread, wait_result_t result);
@@ -590,7 +591,7 @@ static struct {
 	/* cadence, reported every five seconds while on: vsyncs with a new picture, with the same one again, pictures
 	 * replaced before a vsync showed them, and the gaps between the window server's pictures (ms: <12, <20, <30, <45,
 	 * more) */
-	struct { uint32_t vsyncs, shown, repeated, overwritten, gaps[5], gap_max; uint64_t last_in, since; } c;
+	struct { uint32_t vsyncs, shown, repeated, overwritten, gaps[5], gap_max, writes_blank, writes_active, write_line_max; uint64_t last_in, since; } c;
 } plane;
 static LCK_MTX_DECLARE(plane_lock, &vpu_grp);
 static bool worker_started;
@@ -754,8 +755,10 @@ program_layer(const struct plane_picture *p, const struct rect *d)
 		/* AFBC0 into VD1: AXI and data from it, its line memory (bits 12, 10, 22) */
 		vc_m(VD1_AFBCD0_MISC_CTRL, 0x7fffff, 1u << 22 | 1u << 12 | 1u << 10);
 		uint32_t depth = p->picture.depth == 10 ? 2u : 0u;    /* BITDEPTH_Y/U/V 10 */
-		/* mif urgent 3, hold 8 lines, burst 2, the sample sizes, scatter (the body in pages) */
-		vc_wr(AFBC_MODE, 3u << 24 | 8u << 16 | 2u << 14 | (depth << 8 | depth << 10 | depth << 12) | 1u << 29 |
+		/* mif urgent 3, hold 16 lines (8: a letterboxed 4K picture after a scene cut came out with a line of coloured
+		 * dots a few dozen lines down, the decompressor short of data where it starts after the black bar), burst 2,
+		 * the sample sizes, scatter (the body in pages) */
+		vc_wr(AFBC_MODE, 3u << 24 | 16u << 16 | 2u << 14 | (depth << 8 | depth << 10 | depth << 12) | 1u << 29 |
 		    (skip == 2 ? 0x33u : 0));
 		vc_wr(AFBC_CONV_CTRL, 0x100 | 2u << 12);              /* line buffer 0x100, 4:2:0 */
 		vc_wr(AFBC_DEC_DEF_COLOR, 0x3ffu << 20 | 0x80u << (depth + 10) | 0x80u << depth);
@@ -1067,6 +1070,7 @@ plane_worker(__unused void *arg, __unused wait_result_t result)
 		/* a refresh went by (TWL_VPLANE_WAIT's callers wake) */
 		os_atomic_inc(&vsync_seq, relaxed);
 		thread_wakeup_prim((event_t)&vsync_seq, FALSE, THREAD_AWAKENED);
+		hakios_vdec_plane_vsync();
 		if (plane.on) {
 			uint64_t now = mach_absolute_time(), ns;
 			plane.c.vsyncs++;
@@ -1076,9 +1080,11 @@ plane_worker(__unused void *arg, __unused wait_result_t result)
 			absolutetime_to_nanoseconds(now - plane.c.since, &ns);
 			if (ns >= 5 * NSEC_PER_SEC) {
 				printf("vplane: cadence: %u vsyncs in %llu ms: %u new, %u again, %u replaced unshown; gaps <12 %u, <20 %u, "
-				    "<30 %u, <45 %u, more %u, max %u ms\n", plane.c.vsyncs, ns / NSEC_PER_MSEC, plane.c.shown,
+				    "<30 %u, <45 %u, more %u, max %u ms; pictures written in the blanking %u, during the picture %u "
+				    "(as late as line %u)\n", plane.c.vsyncs, ns / NSEC_PER_MSEC, plane.c.shown,
 				    plane.c.repeated, plane.c.overwritten, plane.c.gaps[0], plane.c.gaps[1], plane.c.gaps[2],
-				    plane.c.gaps[3], plane.c.gaps[4], plane.c.gap_max);
+				    plane.c.gaps[3], plane.c.gaps[4], plane.c.gap_max, plane.c.writes_blank, plane.c.writes_active,
+				    plane.c.write_line_max);
 				uint64_t last_in = plane.c.last_in;
 				bzero(&plane.c, sizeof(plane.c));
 				plane.c.last_in = last_in;
@@ -1093,6 +1099,14 @@ plane_worker(__unused void *arg, __unused wait_result_t result)
 			    d.w == plane.dst.w && d.h == plane.dst.h;
 			if (same) {
 				program_picture(&plane.next);
+				/* (diagnosis: where the scan was when the new picture's registers were written) */
+				uint32_t line = vc_rd(ENCP_INFO_READ) >> 16 & 0x1fff, begin = vc_rd(ENCP_DE_V_BEGIN), end = vc_rd(ENCP_DE_V_END);
+				if (line >= begin && line < end) {
+					plane.c.writes_active++;
+					if (line - begin > plane.c.write_line_max) plane.c.write_line_max = line - begin;
+				} else {
+					plane.c.writes_blank++;
+				}
 			} else {
 				/* (diagnosis: why the layer is set up again; a set-up shows black for a frame or more) */
 				static uint32_t setups;

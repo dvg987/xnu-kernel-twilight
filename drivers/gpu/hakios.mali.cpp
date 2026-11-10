@@ -89,6 +89,8 @@ const char *clockName(uint32_t sel) {
   return names[sel & 7];
 }
 
+int gClockLevel = -1;
+
 // The GPU's clock and its shader stacks' from one of the fixed PLL's dividers (mali_0, bit 31 clear), ungated; the bus clock ungated; both
 // resets released. The vendor's Linux sets the rate first and then enables (its glue says the other order may not be ready).
 bool setClocks() {
@@ -109,7 +111,34 @@ bool setClocks() {
   IODelay(100);
   printf("mali: clocks now:    mali %#x stack %#x sys_en0 %#x (%s); reset level %#x\n", gClk[kClkMali / 4], gClk[kClkMaliStack / 4],
          gClk[kClkSysEn0 / 4], clockName(source), gReset[kResetLevel1 / 4]);
+  gClockLevel = 7 - static_cast<int>(source);
   return true;
+}
+
+// The clock at another of its rates while the GPU runs (level 0: 285 MHz ... 4: 800 MHz, the sources 7 down to 3; 5: 852 MHz, gp1_pll, which
+// the caller has had the firmware switch on): each register has two selectors and a switch between them that does not glitch (bit 31), so the
+// idle one is set and ungated, then switched to.
+int clockLevel(int to) {
+  if (!gClk || gClockLevel < 0) return -1;
+  if (to < 0 || to == gClockLevel) return gClockLevel;
+  if (to > 5) to = 5;
+  const uint32_t field = (static_cast<uint32_t>(to == 5 ? 1 : 7 - to) << 9) | (1u << 8);
+  static const uint32_t regs[2] = {kClkMali, kClkMaliStack};
+  for (const uint32_t reg : regs) {
+    uint32_t v = gClk[reg / 4];
+    const unsigned shift = (v >> 31) ? 0 : 16;   // the selector not in use
+    v &= ~(0xfffu << shift);
+    gClk[reg / 4] = v;
+    v |= field << shift;
+    gClk[reg / 4] = v;
+    __asm__ volatile("dsb sy" ::: "memory");
+    IODelay(20);
+    gClk[reg / 4] = v ^ (1u << 31);
+    __asm__ volatile("dsb sy" ::: "memory");
+  }
+  IODelay(20);
+  gClockLevel = to;
+  return to;
 }
 
 bool softReset() {
@@ -183,7 +212,6 @@ void l2Test() {
 
 // ========================================================================================================== M1: firmware and MCU
 
-extern "C" void pmap_set_cache_attributes(unsigned int pn, unsigned int attributes);
 
 const unsigned char *kFirmware;   // fw/mali_csffw.bin of the small image (mali_start)
 size_t kFirmwareSize;
@@ -191,8 +219,10 @@ size_t kFirmwareSize;
 // GPU-visible memory: physically contiguous below 2^40 (the GPU's output address width), 4 KiB aligned, Normal non-cacheable for the CPU
 // (VM_WIMG_WCOMB = 0x6; the GPU of this SoC is not cache coherent: coherency features read 0). Unaligned accesses, which memcpy does,
 // are not allowed on device memory: the buffer is made write-combining (Normal non-cacheable) from the start, its kernel mapping too (on
-// this XNU the later attribute change does not reach the descriptor's own mapping, and bzero's DC ZVA faulted on it), and the pages'
-// attribute set to the same for the mappings made later.
+// this XNU the later attribute change does not reach the descriptor's own mapping, and bzero's DC ZVA faulted on it). Every mapping made
+// later names its cache mode itself; the pages' own attribute (pmap_set_cache_attributes) is left alone. That call takes 16 KiB page
+// numbers: given pa >> 12 it changed the page at four times the address, which was past the end of RAM only while the kernel's
+// memory began at 0x20000000; below that it made other pages uncached and their atomics faulted.
 struct Mem {
   IOBufferMemoryDescriptor *md;
   uint8_t *kva;
@@ -215,8 +245,6 @@ bool memAlloc(Mem &m, size_t size) {
   const uint64_t pa = md->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
   uint8_t *kva = static_cast<uint8_t *>(md->getBytesNoCopy());
   if (!kva || !pa || length < size || (pa & 0xfff)) { (void)md->complete(); md->release(); return false; }
-  for (uint64_t off = 0; off < size; off += 0x1000) pmap_set_cache_attributes(static_cast<unsigned int>((pa + off) >> 12), 0x6U);
-  __asm__ volatile("dsb sy\n\tisb" ::: "memory");
   memset(kva, 0, size);
   __asm__ volatile("dsb sy" ::: "memory");
   m.md = md; m.kva = kva; m.pa = pa; m.size = size;
@@ -745,8 +773,6 @@ constexpr unsigned kJobSlots = 16, kJobBytes = kJobSlots * 8;   // Panthor pads 
 
 void memFree(Mem &m) {
   if (!m.md) return;
-  for (uint64_t off = 0; off < m.size; off += 0x1000) pmap_set_cache_attributes(static_cast<unsigned int>((m.pa + off) >> 12), 0x2U);   // VM_WIMG_DEFAULT
-  __asm__ volatile("dsb sy\n\tisb" ::: "memory");
   (void)m.md->complete();
   m.md->release();
   m.md = nullptr; m.kva = nullptr; m.pa = 0; m.size = 0;
@@ -838,7 +864,6 @@ void boPoolInit() {
     const uint64_t pa = md->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
     uint8_t *kva = static_cast<uint8_t *>(md->getBytesNoCopy());
     if (!kva || !pa || length < kGranule || (pa & (kGranule - 1))) { (void)md->complete(); md->release(); ++fails; continue; }
-    for (size_t off = 0; off < kGranule; off += 0x1000) pmap_set_cache_attributes(static_cast<unsigned int>((pa + off) >> 12), 0x6U);
     g[n++] = PoolGranule{md, kva, pa, 0};
   }
   __asm__ volatile("dsb sy\n\tisb" ::: "memory");
@@ -862,11 +887,6 @@ bool boPoolTake(unsigned count, unsigned *out) {
 void boFree(Bo *bo) {
   if (!bo) return;
   if (bo->pooled) { for (unsigned i = 0; i < bo->poolCount; ++i) gBoPool.g[bo->poolIdx[i]].used = 0; gBoPool.inUse -= bo->poolCount; IODeleteData(bo->poolIdx, unsigned, bo->poolCount); }
-  if (!bo->host && !bo->pooled) {
-    for (size_t off = 0; bo->pages && off < bo->size; off += 0x1000)
-      if (bo->pages[off >> 12]) pmap_set_cache_attributes(static_cast<unsigned int>(bo->pages[off >> 12] >> 12), 0x2U);
-    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
-  }
   if (bo->host) { (void)bo->host->complete(); bo->host->release(); }
   if (bo->md) { (void)bo->md->complete(); bo->md->release(); }
   if (bo->pages) IODeleteData(bo->pages, uint64_t, bo->size >> 12);
@@ -943,8 +963,6 @@ Bo *boCreate(size_t size, void *owner) {
     for (IOByteCount in = 0; in + 0x1000 <= length && off < size; in += 0x1000, off += 0x1000) bo->pages[off >> 12] = pa + in;
   }
   if (!bo->kva) { boFree(bo); return nullptr; }
-  for (size_t off = 0; off < size; off += 0x1000) pmap_set_cache_attributes(static_cast<unsigned int>(bo->pages[off >> 12] >> 12), 0x6U);
-  __asm__ volatile("dsb sy\n\tisb" ::: "memory");
   memset(bo->kva, 0, size);
   __asm__ volatile("dsb sy" ::: "memory");
   return bo;
@@ -1195,6 +1213,9 @@ struct Heap {
   Ctx *ctx;
   void *owner;
   uint32_t chunkSize, chunkCount, maxChunks;
+  uint32_t capacity;        // the arrays' length: room for maxChunks (bounded), so that the heap can grow on the tiler's out-of-memory
+  uint32_t targetInFlight;  // render passes in flight past which a growth is refused (the firmware then waits for fragments)
+  uint32_t grown;
   Bo **chunks;
   uint64_t *chunkVa;
   uint64_t ctxVa;
@@ -1221,8 +1242,8 @@ void heapFree(Heap &h) {
     vmUnmap(h.ctx->pt, h.chunkVa[i], h.chunks[i]->size);
     boRelease(h.chunks[i]);
   }
-  if (h.chunks) IODelete(h.chunks, Bo *, h.chunkCount);
-  if (h.chunkVa) IODeleteData(h.chunkVa, uint64_t, h.chunkCount);
+  if (h.chunks) IODelete(h.chunks, Bo *, h.capacity);
+  if (h.chunkVa) IODeleteData(h.chunkVa, uint64_t, h.capacity);
   memset(&h, 0, sizeof h);
 }
 
@@ -1237,7 +1258,8 @@ void heapsFree(Ctx *c) {
 }
 
 // initialChunks chunks of chunkSize (a multiple of 4 KiB, 128 KiB .. 8 MiB), chained newest first. Returns the heap's index or -1.
-int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxChunks, void *owner, uint64_t *ctxVa, uint64_t *firstChunkVa) {
+int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxChunks, uint32_t targetInFlight, void *owner, uint64_t *ctxVa,
+               uint64_t *firstChunkVa) {
   if (!initialChunks || initialChunks > maxChunks || (chunkSize & 0xfff) || chunkSize < 0x20000 || chunkSize > 0x800000) return -1;
   if (!c.heapPool) {
     Bo *pool = boCreate(kMaxHeapsPerCtx * kHeapCtxStride, nullptr);
@@ -1261,11 +1283,13 @@ int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxC
 
   Heap &h = gHeap[slot];
   memset(&h, 0, sizeof h);
-  h.ctx = &c; h.owner = owner; h.chunkSize = chunkSize; h.maxChunks = maxChunks;
-  h.chunks = IONewZero(Bo *, initialChunks);
-  h.chunkVa = IONewZeroData(uint64_t, initialChunks);
+  h.ctx = &c; h.owner = owner; h.chunkSize = chunkSize; h.maxChunks = maxChunks; h.targetInFlight = targetInFlight;
+  h.capacity = maxChunks < 512 ? maxChunks : 512;
+  if (h.capacity < initialChunks) h.capacity = initialChunks;
+  h.chunks = IONewZero(Bo *, h.capacity);
+  h.chunkVa = IONewZeroData(uint64_t, h.capacity);
   h.used = true;
-  if (!h.chunks || !h.chunkVa) { h.chunkCount = initialChunks; heapFree(h); return -1; }
+  if (!h.chunks || !h.chunkVa) { h.chunkCount = 0; heapFree(h); return -1; }
   h.chunkCount = initialChunks;
   uint64_t previous = 0;
   for (uint32_t i = 0; i < initialChunks; ++i) {
@@ -1289,6 +1313,29 @@ int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxC
   printf("mali: tiler heap %u in address space %u: %u chunks of %#x at %#llx.. (head %#llx), context at %#llx\n", slot, c.as, initialChunks, chunkSize,
          static_cast<unsigned long long>(h.chunkVa[0]), static_cast<unsigned long long>(previous), static_cast<unsigned long long>(h.ctxVa));
   return static_cast<int>(slot);
+}
+
+// Panthor's panthor_heap_grow(): one more chunk for a heap whose tiler ran out, unlinked (the firmware links it into the heap
+// context's chain), named the way the firmware wants it: its address with the size in 4 KiB units in the low bits. 0: refused --
+// past the render passes in flight the heap allows, at its maximum, or no memory -- and the firmware waits for fragments to free some.
+uint64_t heapGrow(Heap &h, uint32_t renderpassesInFlight) {
+  if (renderpassesInFlight > h.targetInFlight || h.chunkCount >= h.maxChunks || h.chunkCount >= h.capacity) return 0;
+  Bo *bo = boCreate(h.chunkSize, nullptr);
+  if (!bo) return 0;
+  const uint64_t va = ctxKernelVaAligned(*h.ctx, h.chunkSize, h.chunkSize >= 0x200000 ? 0x200000 : 0x1000);
+  if (!ctxMapKernelBo(*h.ctx, bo, va, kLeafCached)) { boRelease(bo); return 0; }
+  __asm__ volatile("dsb sy" ::: "memory");
+  h.chunks[h.chunkCount] = bo;
+  h.chunkVa[h.chunkCount] = va;
+  ++h.chunkCount;
+  ++h.grown;
+  return (va & ~0xfffull) | (h.chunkSize >> 12);
+}
+
+Heap *heapAt(Ctx *c, uint64_t ctxVa) {
+  for (unsigned i = 0; i < kMaxHeaps; ++i)
+    if (gHeap[i].used && gHeap[i].ctx == c && gHeap[i].ctxVa == ctxVa) return &gHeap[i];
+  return nullptr;
 }
 
 // What lives in the MCU's address space for a CSG slot: the queues' input / output pages and the suspend buffers. Allocated on first use, kept.
@@ -1830,9 +1877,23 @@ void m1() {
 class MaliClient : public IOUserClient {
   OSDeclareDefaultStructors(MaliClient)
 
-  static constexpr unsigned kMaxBoHandles = 4096;
+  // Mesa makes a buffer object of every vertex buffer and texture: a game keeps thousands alive (Minecraft's world: ~4000, when 4096
+  // was the limit and its next allocation failed). The table is 512 KiB a connection; a handle is looked for from boFree up.
+  static constexpr unsigned kMaxBoHandles = 65536;
   task_t ownerTask = nullptr;   // the process that opened this connection (BO_CREATE_HOST wires its pages)
   Bo **bos = nullptr;      // handle - 1
+  unsigned boFree = 0;     // no handle below this one is free
+  bool handlesFullSaid = false;
+  unsigned newHandle() {
+    unsigned h = boFree;
+    while (h < kMaxBoHandles && bos[h]) ++h;
+    boFree = h;
+    if (h == kMaxBoHandles && !handlesFullSaid) {
+      handlesFullSaid = true;
+      printf("mali: %s has all %u buffer handles in use: the next ones are refused\n", ownerName, kMaxBoHandles);
+    }
+    return h;
+  }
   bool closed = false;
   char ownerName[17] = {};         // what the process is called, for the line the connection leaves when it closes
   uint64_t boLiveBytes = 0, boPeakBytes = 0, boHostBytes = 0, boCreated = 0;   // what it asked for: a process under a memory limit is killed for its footprint
@@ -2059,6 +2120,48 @@ inline uint64_t cntvct() {
   return v;
 }
 
+// Panthor's group_process_tiler_oom(): a stream whose tiler ran out of heap raises CS_TILER_OOM (bit 26 of its ack, toggled). It
+// is answered with a new chunk for the heap the stream names (its output: heap address, the vertex/tiler and fragment counters), or
+// with none (heap start = end = 0: the firmware waits for fragment work to give chunks back), then the event acknowledged and the
+// slot's doorbell rung. Polled like everything else: on every call and every couple of milliseconds from the watchdog's thread.
+void gpuOomScan() {
+  static unsigned shown;
+  constexpr uint32_t kTilerOom = 1u << 26;
+  for (unsigned slot = 0; slot < kMaxGroups; ++slot) {
+    Group *g = gSlotGroup[slot];
+    SlotView s;
+    if (!g || !g->ctx || !slotView(slot, s)) continue;
+    bool rang = false;
+    for (unsigned q = 0; q < g->queues; ++q) {
+      CsView c;
+      if (!csView(s, q, c) || !((c.in->req ^ c.out->ack) & kTilerOom)) continue;
+      const volatile uint32_t *o = reinterpret_cast<const volatile uint32_t *>(c.out);
+      const uint32_t vtStart = o[0xc0 / 4], vtEnd = o[0xc4 / 4], fragEnd = o[0xcc / 4];
+      const uint64_t heapVa = (static_cast<uint64_t>(o[0xd4 / 4]) << 32) | o[0xd0 / 4];
+      Heap *h = heapAt(g->ctx, heapVa);
+      uint64_t chunk = 0;
+      if (h && fragEnd <= vtEnd && vtEnd < vtStart) chunk = heapGrow(*h, vtStart - fragEnd);
+      c.in->heapStart = chunk;
+      c.in->heapEnd = chunk;
+      __asm__ volatile("dsb sy" ::: "memory");
+      c.in->req = (c.in->req & ~kTilerOom) | (c.out->ack & kTilerOom);
+      s.in->doorbellReq = (s.in->doorbellReq & ~(1u << q)) | ((~s.out->doorbellAck) & (1u << q));
+      rang = true;
+      if (shown < 40) {
+        ++shown;
+        const MaliClient *owner = static_cast<const MaliClient *>(g->owner);
+        printf("mali: tiler out of memory: %s's group %u queue %u, heap %#llx (vt %u..%u, frag %u): %s (%u chunks, %u added so far)\n",
+               owner ? owner->name() : "the kernel", g->id, q, static_cast<unsigned long long>(heapVa), vtStart, vtEnd, fragEnd,
+               chunk ? "a chunk added" : h ? "none given: wait for fragments" : "NO SUCH HEAP", h ? h->chunkCount : 0u, h ? h->grown : 0u);
+      }
+    }
+    if (rang) {
+      __asm__ volatile("dsb sy" ::: "memory");
+      ringGlobalDoorbell(slot);
+    }
+  }
+}
+
 // What a stuck group is doing: slot, address space, per queue jobs done / given, ring extract / insert, and where the firmware says its stream stands
 // (command pointer, what it is blocked on; the firmware writes that only when asked: CSG_REQ_STATUS_UPDATE).
 const char *const kBlockedReason[] = {"unblocked", "scoreboard wait", "progress wait", "sync wait", "deferred", "resource", "flush"};
@@ -2176,9 +2279,10 @@ void gpuStallScan() {
 // The watchdog's own thread: while every client only polls its syncobjs nobody calls the driver, and a stuck GPU would stay stuck.
 void gpuWatchdog(void *, wait_result_t) {
   for (;;) {
-    IOSleep(500);
+    IOSleep(2);
     IOLockLock(gLock);
-    gpuStallScan();
+    gpuOomScan();
+    gpuStallScan();   // (itself at most twice a second)
     IOLockUnlock(gLock);
   }
 }
@@ -2186,7 +2290,7 @@ void gpuWatchdogStart() {
   unsigned hangMs = 3000;
   PE_parse_boot_argn("mali-hang-ms", &hangMs, sizeof hangMs);
   thread_t t;
-  if (!hangMs) return;
+  (void)hangMs;   // the thread also answers the tiler's out-of-memory: it runs whatever the watchdog's setting
   if (kernel_thread_start(gpuWatchdog, nullptr, &t) == KERN_SUCCESS) {
     thread_deallocate(t);
     printf("mali: GPU watchdog: a group with no job done for %u ms is taken off the GPU\n", hangMs);
@@ -2268,6 +2372,7 @@ IOReturn MaliClient::externalMethod(uint32_t selector, IOExternalMethodArguments
       r = closed ? static_cast<IOReturn>(kIOReturnNotAttached)
                  : dispatch(selector, static_cast<const uint8_t *>(a->structureInput), a->structureInputSize, static_cast<uint8_t *>(a->structureOutput), a->structureOutputSize, &outSize);
       if (selector == MALI_GROUP_SUBMIT || selector == MALI_GROUP_DESTROY) gpuFaultScan(selector == MALI_GROUP_SUBMIT ? "after a submit" : "after a group destroy");
+      gpuOomScan();
       gpuStallScan();
       if (r != kIOReturnNotReady || tries >= 10000) break;   // a submit that found no slot: the busy groups finish on their own, without the lock
       IOLockUnlock(gLock);
@@ -2320,8 +2425,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
     case MALI_BO_CREATE: {
       NEED_IN(mali_bo_create_in, i);
       if (!i.size || i.size > (1ull << 32)) return kIOReturnBadArgument;
-      unsigned h = 0;
-      while (h < kMaxBoHandles && bos[h]) ++h;
+      const unsigned h = newHandle();
       if (h == kMaxBoHandles) return kIOReturnNoResources;
       Bo *bo = boCreate(static_cast<size_t>(i.size), this);
       if (!bo) return kIOReturnNoMemory;
@@ -2346,9 +2450,8 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
     }
     case MALI_BO_CREATE_HOST: {
       NEED_IN(mali_bo_create_host_in, i);
-      unsigned h = 0;
-      while (h < kMaxBoHandles && bos[h]) ++h;
-      if (h == kMaxBoHandles) { printf("mali: host bo refused: all %u handles in use\n", (unsigned)kMaxBoHandles); return kIOReturnNoResources; }
+      const unsigned h = newHandle();
+      if (h == kMaxBoHandles) return kIOReturnNoResources;
       if (!i.size || (i.ptr | i.size) & 0xfff || i.size > (1ull << 30)) {
         printf("mali: host bo refused by the call: ptr %#llx size %#llx\n", (unsigned long long)i.ptr, (unsigned long long)i.size);
         return kIOReturnBadArgument;
@@ -2367,6 +2470,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       if (!bo) return kIOReturnBadArgument;
       if (!bo->host && !bo->hostCopy) boLiveBytes -= bo->size;
       bos[i.handle - 1] = nullptr;
+      if (i.handle - 1 < boFree) boFree = i.handle - 1;
       boRelease(bo);
       return kIOReturnSuccess;
     }
@@ -2404,13 +2508,13 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       Ctx *c = vmFor(i.vm);
       if (!c) return kIOReturnBadArgument;
       mali_heap_create_out o = {};
-      // No chunk is ever added to a heap (no out-of-memory handling yet), so it starts with enough for the window server's longest command
-      // buffers: boot-arg mali-heap-chunks=N (default 24) at the least, within the client's maximum.
+      // It starts with enough for the window server's longest command buffers -- boot-arg mali-heap-chunks=N (default 24) at the least,
+      // within the client's maximum -- and grows from there on the tiler's out-of-memory (gpuOomScan).
       static unsigned least = 0;
       if (!least) { least = 24; PE_parse_boot_argn("mali-heap-chunks", &least, sizeof least); }
       uint32_t initial = i.initial_chunk_count;
       if (initial < least) initial = least < i.max_chunks ? least : i.max_chunks;
-      const int slot = heapCreate(*c, initial, i.chunk_size, i.max_chunks, this, &o.ctx_va, &o.first_chunk_va);
+      const int slot = heapCreate(*c, initial, i.chunk_size, i.max_chunks, i.target_in_flight, this, &o.ctx_va, &o.first_chunk_va);
       if (slot < 0) return kIOReturnNoMemory;
       o.handle = static_cast<uint32_t>(slot) + 1;
       PUT_OUT(mali_heap_create_out, o);
@@ -2849,6 +2953,24 @@ extern "C" void mali_fence_describe(const uint64_t *entries, unsigned count) {
 }
 
 // The host's own cache clean (GPU_CMD FLUSH_CACHES: L2 and load/store cache clean), for the display's check that the GPU's output reached memory.
+// For the governor (hakios.amlcpu.c): whether the GPU is working now (-1: not up), and its clock's level read (-1) or set.
+extern "C" int hakios_mali_active(void) { return gGpu && gClockLevel >= 0 ? static_cast<int>(gpu(kStatus) & 1) : -1; }
+extern "C" int hakios_mali_level(int to) { return clockLevel(to); }
+// The clock the GPU has now, in MHz: its cycle counter over 5 ms of the architected counter.
+extern "C" unsigned hakios_mali_mhz(void) {
+  if (!gGpu || gClockLevel < 0) return 0;
+  auto cycles = [] { uint32_t hi = gpu(0x94), lo = gpu(0x90); const uint32_t hi2 = gpu(0x94); if (hi2 != hi) { hi = hi2; lo = gpu(0x90); } return (static_cast<uint64_t>(hi) << 32) | lo; };
+  auto counter = [] { uint64_t v; __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v)); return v; };
+  gpuWrite(kCmd, 0x103);
+  IODelay(200);
+  const uint64_t c0 = cycles(), t0 = counter();
+  IODelay(5000);
+  const uint64_t c1 = cycles(), t1 = counter();
+  uint64_t freq = 0; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+  const uint64_t us = freq ? (t1 - t0) * 1000000 / freq : 0;
+  return us ? static_cast<unsigned>((c1 - c0) / us) : 0;
+}
+
 extern "C" bool mali_clean_caches(void) {
   if (!gLock || !gGpu) return false;
   IOLockLock(gLock);

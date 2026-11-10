@@ -222,6 +222,16 @@ flash_root(const char *dev)
 		}
 		check(ok, "our bundles in /System/Library/Extensions, over the volume's own");
 	}
+	if (stat(in_image("/vdecoders"), &fw_st) == 0) {
+		/* the hardware video decoder (VDEC=1): VideoToolbox dlopens AVD.videodecoder from here in every process */
+		ok = mount("bindfs", "/flash/System/Library/VideoDecoders", MNT_RDONLY | MNT_UNION,
+		    (void *)in_image("/vdecoders")) == 0;
+		if (!ok) {
+			printf("  bindfs %s on /flash/System/Library/VideoDecoders, union: %s\n", in_image("/vdecoders"),
+			    strerror(errno));
+		}
+		check(ok, "our video decoder in /System/Library/VideoDecoders, over the volume's own");
+	}
 	if (stat("/jb-bin", &fw_st) == 0) {
 		/*
 		 * The package manager's prefix is in the boot volume (/jb), and Sileo runs mv, cp, rm, mkdir

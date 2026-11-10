@@ -778,6 +778,7 @@ hakios_hevc_slice(struct twl_hevc_slice *s)
 		H.cur_poc = s->poc;
 		WR(HEVC_WAIT_FLAG, RD(HEVC_WAIT_FLAG) | 0x2);
 		if (new_pic) {
+			hakios_vdec_slot_wait(s->slot, H.n_pics);
 			H.cur = (int)s->slot;
 			H.slice_idx = 0;
 			H.decode_count++;
@@ -790,9 +791,18 @@ hakios_hevc_slice(struct twl_hevc_slice *s)
 				for (uint32_t i = 0; i < H.n_pics; i++)
 					if (i != s->slot && !(keep & (1u << i))) pages_trim(i, 0);
 				/* short: the held pictures no reference names go back to their copies, never the plane's (it reads them) */
-				if (P.top < pages)
+				if (P.top < pages) {
+					static uint32_t short_times, held_trimmed;
+					uint32_t held = hakios_vdec_held(H.n_pics);
 					for (uint32_t i = 0; i < H.n_pics; i++)
-						if (i != s->slot && !((s->referenced | showing) & (1u << i))) pages_trim(i, 0);
+						if (i != s->slot && !((s->referenced | showing) & (1u << i))) {
+							if ((held & (1u << i)) && P.count[i]) held_trimmed++;
+							pages_trim(i, 0);
+						}
+					if (++short_times % 100 == 1)
+						printf("hevc: pages short %u times: %u held pictures went back to their copies\n", short_times,
+						    held_trimmed);
+				}
 			}
 			H.pic[H.cur].done = false;
 			if (!pages_take(H.cur, pages)) {

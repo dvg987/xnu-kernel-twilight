@@ -91,7 +91,10 @@ for offset, used, names in slots:
     hand = [n for n in names if n in by_hand]
     if hand:
         entries.append((offset, names[0], 'hand', 'my_' + hand[0]))
-        # ... and the library's own function for it, for an application's context (eagl_fill_table_plain)
+        # ... and the library's own function for it, for an application's context (eagl_fill_table_plain), unless ours only
+        # checks and says (a shader that does not compile, a program that does not link: an application never tells)
+        if hand[0] in ('glCompileShader', 'glLinkProgram', 'glInvalidateFramebuffer', 'glFramebufferRenderbuffer', 'glDeleteFramebuffers'):
+            continue
         for n in names:
             target = library_name(n)
             if target and n in protos:
@@ -148,8 +151,34 @@ for offset in sorted(plain):
     name, function = plain[offset]
     ret, params = protos[name]
     args = ', '.join(p[1] for p in params)
-    emit('static %s\nplain_%04x(void *context%s)\n{\n\t(void)context;' % (ret, offset, ''.join(', %s %s' % p for p in params)))
-    emit('\t%s%s(%s);\n}' % ('' if ret == 'void' else 'return ', function, args))
+    # as a slot_ one: counted, traced on request, its error asked for (an application's draws, clears and binds are these)
+    emit('static %s\nplain_%04x(void *context%s)\n{' % (ret, offset, ''.join(', %s %s' % p for p in params)))
+    emit('\tEAGL_ENTER(context, %#x);' % offset)
+    emit('\tif (eagl_tracing) {\n\t\teagl_trace("%s(%s)\\n"%s);\n\t}' % (name, ', '.join(trace_format(p[0]) for p in params),
+         ''.join(', ' + trace_value(p) for p in params)))
+    if ret == 'void':
+        emit('\t%s(%s);\n\tEAGL_LEAVE(context, %#x);\n}' % (function, args, offset))
+    else:
+        emit('\t%s result = %s(%s);\n\tEAGL_LEAVE(context, %#x);\n\treturn result;\n}' % (ret, function, args, offset))
+# the extensions an application may be told of: OpenGL ES ones whose every command Darwin's table has an entry for (an
+# application -- Skia -- that sees an extension looks its functions up in OpenGLES.framework and gives up when one is
+# not there); those with no commands at all are features of the library's, and pass too
+apple = set(n for _, _, names in slots for n in names)
+app_extensions = []
+for ext in ET.parse(xml_path).getroot().iter('extension'):
+    if 'gles2' not in ext.get('supported', '').split('|'):
+        continue
+    commands = set()
+    for require in ext.findall('require'):
+        if require.get('api') not in (None, 'gles2'):
+            continue
+        commands.update(c.get('name') for c in require.findall('command'))
+    if commands <= apple:
+        app_extensions.append(ext.get('name'))
+emit('static const char *const eagl_app_extensions[] = {')
+for name in sorted(app_extensions):
+    emit('\t"%s",' % name)
+emit('\tNULL\n};')
 emit('#define EAGL_TABLE_SIZE %#x' % top)
 emit('static const char *\neagl_slot_name(unsigned offset)\n{\n\tswitch (offset) {')
 for offset in sorted(known):

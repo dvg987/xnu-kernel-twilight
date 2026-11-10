@@ -129,6 +129,116 @@ cpusample_loop(void *arg __unused, wait_result_t result __unused)
 	}
 }
 
+/*
+ * twl_canary_range=BASE+SIZE (twloader's twl_canary=1, an experiment): RAM the boot loader filled with a pattern (each 64-bit
+ * word its own address ^ 0x5a5aa5a5c3c33c3c) and named a hole, so that nobody of the kernel's writes there. Every 10 s the
+ * range is read back through an uncached mapping, and what changed is reported: which pages, the first word that differs.
+ */
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+extern void IOSleep(unsigned int milliseconds);
+
+static uint64_t canary_base, canary_size;
+#define CANARY_CHUNK (2u << 20)       /* mapped a piece at a time: io_map's space is far smaller than the range */
+
+static uint64_t
+canary_hex(const char **pp)
+{
+	const char *p = *pp;
+	uint64_t v = 0;
+	if (p[0] == '0' && p[1] == 'x') {
+		p += 2;
+	}
+	for (;; p++) {
+		if (*p >= '0' && *p <= '9') {
+			v = v * 16 + (uint64_t)(*p - '0');
+		} else if (*p >= 'a' && *p <= 'f') {
+			v = v * 16 + (uint64_t)(*p - 'a' + 10);
+		} else {
+			break;
+		}
+	}
+	*pp = p;
+	return v;
+}
+
+static void
+canary_loop(__unused void *arg, __unused wait_result_t wr)
+{
+	unsigned int rounds = 0, reported = 0;
+	static uint8_t seen[4096];       /* a bit per 2 MB... per 4 KB page up to 128 MB a byte: pages already reported */
+
+	for (;;) {
+		IOSleep(10000);
+		rounds++;
+		uint64_t changed = 0, first = 0;
+		vm_offset_t chunk = 0;
+		for (uint64_t off = 0; off < canary_size; off += 4096) {
+			if ((off % CANARY_CHUNK) == 0) {
+				if (chunk) {
+					ml_io_unmap(chunk, CANARY_CHUNK);
+				}
+				chunk = ml_io_map(canary_base + off, CANARY_CHUNK);
+				if (!chunk) {
+					break;
+				}
+			}
+			const volatile uint64_t *w = (const volatile uint64_t *)(chunk + off % CANARY_CHUNK);
+			uint64_t pa = canary_base + off;
+			for (unsigned int i = 0; i < 512; i++) {
+				uint64_t want = (pa + i * 8) ^ 0x5a5aa5a5c3c33c3cULL, got = w[i];
+				if (got != want) {
+					unsigned int bad = 1;
+					for (unsigned int j = i + 1; j < 512; j++) {
+						bad += w[j] != ((pa + j * 8) ^ 0x5a5aa5a5c3c33c3cULL);
+					}
+					changed++;
+					if (!first) {
+						first = pa;
+					}
+					uint64_t page = off >> 12;
+					if (reported < 200 && page / 8 < sizeof(seen) * 8 / 8 && !(seen[(page / 8) % sizeof(seen)] & (1u << (page % 8)))) {
+						seen[(page / 8) % sizeof(seen)] |= (uint8_t)(1u << (page % 8));
+						reported++;
+						printf("canary: page %#llx written (round %u): word %u = %#llx (was %#llx), %u of its 512 words differ\n",
+						    (unsigned long long)pa, rounds, i, (unsigned long long)got, (unsigned long long)want, bad);
+					}
+					break;
+				}
+			}
+		}
+		if (chunk) {
+			ml_io_unmap(chunk, CANARY_CHUNK);
+		}
+		printf("canary: round %u: %llu of %llu pages changed%s%#llx\n", rounds, (unsigned long long)changed,
+		    (unsigned long long)(canary_size >> 12), changed ? ", the lowest " : "", (unsigned long long)first);
+	}
+}
+
+static void
+hakios_canary_start(void)
+{
+	char arg[64];
+	const char *p = arg;
+	thread_t thread;
+
+	if (!PE_parse_boot_arg_str("twl_canary_range", arg, sizeof(arg))) {
+		return;
+	}
+	canary_base = canary_hex(&p);
+	if (*p++ != '+') {
+		return;
+	}
+	canary_size = canary_hex(&p) & ~(uint64_t)(CANARY_CHUNK - 1);
+	if (canary_size == 0) {
+		return;
+	}
+	if (kernel_thread_start_priority(canary_loop, NULL, MINPRI_KERNEL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		printf("canary: watching %#llx..%#llx for writes\n", (unsigned long long)canary_base, (unsigned long long)(canary_base + canary_size));
+	}
+}
+
 void hakios_cpusample_start(void);
 
 void
@@ -137,6 +247,8 @@ hakios_cpusample_start(void)
 	uint32_t on = 0;
 	thread_t thread;
 
+	hakios_canary_start();
+
 	if (!PE_parse_boot_argn("cpu-sample", &on, sizeof(on)) || on == 0) {
 		return;
 	}
@@ -144,4 +256,25 @@ hakios_cpusample_start(void)
 		thread_deallocate(thread);
 		printf("cpus: sampling the processors every %s\n", "cpu-sample-us (default 4 ms)");
 	}
+}
+
+/*
+ * The time a processor has spent idle since boot (Mach time units; ~0 for a processor that is not running), for the
+ * Amlogic box's clock governor (bsd/dev/hakios.amlcpu.c).
+ */
+uint64_t hakios_cpu_idle_mach(int cpu);
+
+uint64_t
+hakios_cpu_idle_mach(int cpu)
+{
+	processor_t p = cpu_to_processor(cpu);
+	struct recount_usage usage = { 0 };
+	uint64_t idle = 0;
+
+	if (p == PROCESSOR_NULL || p->state == PROCESSOR_OFF_LINE || p->state == PROCESSOR_SHUTDOWN ||
+	    p->state == PROCESSOR_START) {
+		return ~0ull;
+	}
+	recount_processor_usage(&p->pr_recount, &usage, &idle);
+	return idle;
 }

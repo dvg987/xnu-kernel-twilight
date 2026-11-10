@@ -70,6 +70,8 @@ void hakios_hdmitx_set_listener(void (*fn)(void));
 void hakios_hdmitx_osd_source(unsigned w, unsigned h, unsigned stride);  /* what the OSD scans (in the blanking) */
 unsigned hakios_hdmitx_output_height(void);        /* the picture's height on the wire, 0: none */
 uint64_t hakios_hdmitx_frame_ns(void);             /* a frame on the wire in ns, 0: none */
+bool hakios_hdmitx_asleep(void);                   /* tvOS asleep: the TV on standby, the output off */
+void hakios_hdmitx_request_wake(void);              /* the TV asked for this box (CEC): tvOS to wake */
 unsigned hakios_hdmitx_output_width(void);         /* and its width */
 unsigned hakios_hdmitx_color_count(void);          /* colour elements Settings gets (SDR 4, or with HDR10 boot-arg hdmitx_hdrmodes=1) */
 #endif

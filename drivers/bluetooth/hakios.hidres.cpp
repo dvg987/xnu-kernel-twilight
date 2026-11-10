@@ -20,10 +20,15 @@
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSString.h>
+#include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
 
 extern "C" void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 extern "C" void HakiosHIDResourceStart(void);
+extern "C" int hakios_gamepad_attach(const char *name);
+extern "C" void hakios_gamepad_detach(int slot);
+extern "C" void hakios_gamepad_update(int slot, uint32_t buttons, int16_t lx, int16_t ly, int16_t rx, int16_t ry, uint16_t l2, uint16_t r2);
+extern "C" int hakios_gamepad_claimed(void);
 
 #define HAKIOS_BUTTON_DOWN      4               /* sys/hakios.input.h's, which iokit/ does not see */
 #define HAKIOS_BUTTON_UP        5
@@ -222,6 +227,170 @@ hid_held(const struct hid_parser * h, uint8_t id, const uint8_t * p, unsigned n,
 	return count;
 }
 
+/*
+ * Gamepads. Nothing here gives GameController a HID device, so a gamepad's report is decoded here, by its descriptor, into
+ * one state (bsd/dev/hakios.gamepad.c hands it to games: kern.hakios_gamepads), and -- unless a game is reading that --
+ * into the remote's keys, so that the pad moves about tvOS too. Home goes to tvOS always.
+ */
+enum {
+	PAD_A = 1u << 0, PAD_B = 1u << 1, PAD_X = 1u << 2, PAD_Y = 1u << 3, PAD_L1 = 1u << 4, PAD_R1 = 1u << 5, PAD_L2 = 1u << 6,
+	PAD_R2 = 1u << 7, PAD_L3 = 1u << 8, PAD_R3 = 1u << 9, PAD_MENU = 1u << 10, PAD_OPTIONS = 1u << 11, PAD_HOME = 1u << 12,
+	PAD_UP = 1u << 13, PAD_DOWN = 1u << 14, PAD_LEFT = 1u << 15, PAD_RIGHT = 1u << 16, PAD_TOUCHPAD = 1u << 17,
+};
+
+/* the Button page's buttons 1.. of each family, in PAD_* terms */
+static const uint32_t pad_ds4[] = { PAD_X, PAD_A, PAD_B, PAD_Y, PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_OPTIONS, PAD_MENU, PAD_L3, PAD_R3,
+	                            PAD_HOME, PAD_TOUCHPAD };     /* Sony (and what emulates a DualShock 4: an 8BitDo in Mac mode) */
+static const uint32_t pad_xbox[] = { PAD_A, PAD_B, 0, PAD_X, PAD_Y, 0, PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_OPTIONS, PAD_MENU, PAD_HOME,
+	                             PAD_L3, PAD_R3 };            /* Microsoft's Bluetooth HID (Xbox One S firmware before 5) */
+static const uint32_t pad_generic[] = { PAD_A, PAD_B, PAD_X, PAD_Y, PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_OPTIONS, PAD_MENU, PAD_L3, PAD_R3,
+	                                PAD_HOME };
+
+struct pad_state {
+	uint32_t buttons;
+	int16_t lx, ly, rx, ry;
+	uint16_t l2, r2;
+	bool l2_analog, r2_analog;
+};
+
+/* a gamepad: buttons and a stick or a hat */
+static bool
+hid_is_gamepad(const struct hid_parser * h)
+{
+	bool buttons = false, stick = false;
+
+	for (unsigned i = 0; i < h->fields; i++) {
+		const struct hid_field * f = &h->field[i];
+		uint32_t first = f->umax >= f->umin && f->umax != 0 ? f->umin : f->nusages ? f->usages[0] : 0;
+
+		if ((first >> 16) == 0) {
+			first |= (uint32_t)f->page << 16;
+		}
+		if (!f->array && (first >> 16) == 0x09) {
+			buttons = true;
+		}
+		for (unsigned k = 0; k < f->nusages; k++) {
+			stick |= f->usages[k] == 0x010030 || f->usages[k] == 0x010039;
+		}
+		stick |= first == 0x010030 || first == 0x010039;
+	}
+	return buttons && stick;
+}
+
+static int16_t
+pad_axis(int32_t v, int32_t min, int32_t max)
+{
+	if (max <= min) {
+		return 0;
+	}
+	int64_t x = ((int64_t)(v - min) * 65534) / (max - min) - 32767;
+	return (int16_t)(x < -32767 ? -32767 : x > 32767 ? 32767 : x);
+}
+
+static uint16_t
+pad_trigger(int32_t v, int32_t min, int32_t max)
+{
+	if (max <= min) {
+		return 0;
+	}
+	int64_t x = ((int64_t)(v - min) * 65535) / (max - min);
+	return (uint16_t)(x < 0 ? 0 : x > 65535 ? 65535 : x);
+}
+
+static void
+hid_gamepad(const struct hid_parser * h, uint8_t id, const uint8_t * p, unsigned n, const uint32_t * map, unsigned mapped,
+    struct pad_state * st)
+{
+	static const uint32_t hat[8] = { PAD_UP, PAD_UP | PAD_RIGHT, PAD_RIGHT, PAD_DOWN | PAD_RIGHT, PAD_DOWN, PAD_DOWN | PAD_LEFT, PAD_LEFT,
+		                         PAD_UP | PAD_LEFT };
+
+	for (unsigned i = 0; i < h->fields; i++) {
+		const struct hid_field * f = &h->field[i];
+
+		if (f->id != id || f->array) {
+			continue;
+		}
+		for (unsigned k = 0; k < f->count; k++) {
+			uint32_t raw = hid_bits(p, n, f->bit + k * f->size, f->size), usage = 0;
+			int32_t v = (int32_t)raw;
+
+			if (f->min < 0 && f->size < 32 && (raw >> (f->size - 1)) & 1) {
+				v = (int32_t)(raw | (~0u << f->size));          /* a signed field */
+			}
+			if (f->umax >= f->umin && f->umax != 0) {
+				usage = f->umin + k;
+			} else if (f->nusages != 0) {
+				usage = f->usages[k < f->nusages ? k : f->nusages - 1];
+			}
+			if ((usage >> 16) == 0) {
+				usage |= (uint32_t)f->page << 16;
+			}
+			switch (usage) {
+			case 0x010030: st->lx = pad_axis(v, f->min, f->max); break;
+			case 0x010031: st->ly = (int16_t)-pad_axis(v, f->min, f->max); break;
+			case 0x010032: st->rx = pad_axis(v, f->min, f->max); break;
+			case 0x010035: st->ry = (int16_t)-pad_axis(v, f->min, f->max); break;
+			case 0x010033: case 0x0200c5: st->l2 = pad_trigger(v, f->min, f->max); st->l2_analog = true; break;   /* Rx, Brake */
+			case 0x010034: case 0x0200c4: st->r2 = pad_trigger(v, f->min, f->max); st->r2_analog = true; break;   /* Ry, Accelerator */
+			case 0x010039:
+				if (v >= f->min && v <= f->max && v - f->min < 8) {
+					st->buttons |= hat[v - f->min];
+				}
+				break;
+			case 0x0c0223: if (v) { st->buttons |= PAD_HOME; } break;
+			case 0x0c0224: if (v) { st->buttons |= PAD_OPTIONS; } break;
+			default:
+				if ((usage >> 16) == 0x09 && v != 0) {
+					unsigned b = usage & 0xffff;
+
+					if (b >= 1 && b <= mapped) {
+						st->buttons |= map[b - 1];
+					}
+				}
+			}
+		}
+	}
+	if (!st->l2_analog && (st->buttons & PAD_L2)) {
+		st->l2 = 65535;
+	}
+	if (!st->r2_analog && (st->buttons & PAD_R2)) {
+		st->r2 = 65535;
+	}
+}
+
+/* the remote's keys a gamepad's state stands for: the d-pad or the left stick, A select, B back, Start play/pause, Home home */
+static unsigned
+pad_keys(const struct pad_state * st, bool claimed, uint32_t * held)
+{
+	unsigned count = 0;
+	uint32_t b = st->buttons;
+	const int16_t far = 32767 * 6 / 10;
+
+	if (b & PAD_HOME) {
+		held[count++] = 0x0c0040;                       /* the consumer Menu: tvOS's home (see hid_key) */
+	}
+	if (claimed) {
+		return count;
+	}
+	if (st->ly > far && st->ly >= (st->lx < 0 ? -st->lx : st->lx)) {
+		b |= PAD_UP;
+	} else if (st->ly < -far && -st->ly >= (st->lx < 0 ? -st->lx : st->lx)) {
+		b |= PAD_DOWN;
+	} else if (st->lx > far) {
+		b |= PAD_RIGHT;
+	} else if (st->lx < -far) {
+		b |= PAD_LEFT;
+	}
+	if (b & PAD_UP) { held[count++] = 0x0c0042; }
+	if (b & PAD_DOWN) { held[count++] = 0x0c0043; }
+	if (b & PAD_LEFT) { held[count++] = 0x0c0044; }
+	if (b & PAD_RIGHT) { held[count++] = 0x0c0045; }
+	if (b & PAD_A) { held[count++] = 0x0c0041; }
+	if (b & PAD_B) { held[count++] = 0x070029; }      /* Escape: tvOS's back */
+	if (b & PAD_MENU) { held[count++] = 0x0c00cd; }
+	return count;
+}
+
 class IOHIDResource : public IOService
 {
 	OSDeclareDefaultStructors(IOHIDResource);
@@ -248,6 +417,10 @@ class IOHIDResourceDeviceUserClient : public IOUserClient
 	struct hid_parser *     fParser;
 	struct { uint8_t id; uint8_t count; uint32_t code[HID_HELD]; } fHeld[8];
 	unsigned                fReports;
+	int                     fPad;                   /* a gamepad's slot (hakios.gamepad.c), -1: not a gamepad */
+	const uint32_t *        fPadMap;
+	unsigned                fPadMapped, fPadShown;
+	uint32_t                fPadLast;
 
 	IOReturn create(IOExternalMethodArguments * args);
 	IOReturn report(IOExternalMethodArguments * args);
@@ -273,6 +446,7 @@ IOHIDResourceDeviceUserClient::start(IOService * provider)
 	if (!IOUserClient::start(provider)) {
 		return false;
 	}
+	fPad = -1;
 	fQueue = IOSharedDataQueue::withCapacity(16384);
 	fParser = (struct hid_parser *)IOMallocZero(sizeof(struct hid_parser));
 	return fQueue != NULL && fParser != NULL;
@@ -299,6 +473,10 @@ IOHIDResourceDeviceUserClient::stopDevice(void)
 			hakios_touch_post(HAKIOS_BUTTON_UP, fHeld[r].code[k], 0, 0);
 		}
 		fHeld[r].count = 0;
+	}
+	if (fPad >= 0) {
+		hakios_gamepad_detach(fPad);
+		fPad = -1;
 	}
 	if (fDevice != NULL) {
 		fDevice->terminate();
@@ -425,6 +603,16 @@ IOHIDResourceDeviceUserClient::create(IOExternalMethodArguments * args)
 	}
 	IOLog("HakiosHID: \"%s\": descriptor of %u bytes, %u input fields%s\n", fName,
 	    descriptor != NULL ? descriptor->getLength() : 0, fParser->fields, fParser->ids ? " (report IDs)" : "");
+	if (hid_is_gamepad(fParser)) {
+		OSNumber * vendor = OSDynamicCast(OSNumber, fDevice->getProperty("VendorID"));
+		uint32_t vid = vendor != NULL ? vendor->unsigned32BitValue() : 0;
+
+		fPadMap = vid == 0x054c ? pad_ds4 : vid == 0x045e ? pad_xbox : pad_generic;
+		fPadMapped = vid == 0x054c ? sizeof(pad_ds4) / 4 : vid == 0x045e ? sizeof(pad_xbox) / 4 : sizeof(pad_generic) / 4;
+		fPad = hakios_gamepad_attach(fName);
+		IOLog("HakiosHID: \"%s\" is a gamepad (vendor %#x: %s buttons), slot %d\n", fName, vid,
+		    vid == 0x054c ? "DualShock 4" : vid == 0x045e ? "Xbox" : "generic", fPad);
+	}
 	return kIOReturnSuccess;
 }
 
@@ -462,7 +650,21 @@ IOHIDResourceDeviceUserClient::report(IOExternalMethodArguments * args)
 	if (slot == 8) {
 		slot = 0;
 	}
-	count = hid_held(fParser, id, p, n, held);
+	if (fPad >= 0) {
+		struct pad_state st = {};
+
+		hid_gamepad(fParser, id, p, n, fPadMap, fPadMapped, &st);
+		hakios_gamepad_update(fPad, st.buttons, st.lx, st.ly, st.rx, st.ry, st.l2, st.r2);
+		if (st.buttons != fPadLast && fPadShown < 40) {
+			fPadShown++;
+			IOLog("HakiosHID: gamepad %d: buttons %#x, sticks %d,%d %d,%d, triggers %u %u\n", fPad, st.buttons, st.lx, st.ly, st.rx, st.ry,
+			    st.l2, st.r2);
+		}
+		fPadLast = st.buttons;
+		count = pad_keys(&st, hakios_gamepad_claimed() != 0, held);
+	} else {
+		count = hid_held(fParser, id, p, n, held);
+	}
 	for (unsigned k = 0; k < fHeld[slot].count; k++) {                     /* let go */
 		bool still = false;
 

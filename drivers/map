@@ -35,6 +35,7 @@ gpu      bsd/dev/hakios.vp9.c
 gpu      bsd/dev/hakios.vp9_prob.c
 gpu      bsd/dev/hakios.vp9_regs.h
 power    bsd/dev/hakios.wdt.c
+power    bsd/dev/hakios.amlcpu.c
 gpu      bsd/dev/hakios.optee.c
 
 camera   bsd/dev/hakios.camera.c
@@ -89,3 +90,4 @@ wifi     bsd/dev/hakios.w2wpa.c
 wifi     bsd/dev/hakios.w2bt.c
 bluetooth iokit/Kernel/hakios.btsvc.cpp
 bluetooth iokit/Kernel/hakios.hidres.cpp
+bluetooth bsd/dev/hakios.gamepad.c

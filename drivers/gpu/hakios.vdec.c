@@ -184,6 +184,16 @@ static uint32_t plane_passed;   /* the hand-out number of the newest picture the
 static bool out_unshown[LAT_SLOTS];
 static uint32_t slot_generation[TWL_H264_SLOTS], slot_handed[TWL_H264_SLOTS], handed_count, generation_base;
 static _Atomic int plane_slot = -1, plane_pending = -1;
+static _Atomic uint32_t plane_claimed;  /* slots handed to the plane that it has not yet marked pending */
+/*
+ * The picture the plane showed before the one now latched: the VPU's registers take a new picture at the next vsync, so
+ * the old one is still scanned for a frame after it was replaced. Released to the decoder only after that (the vendor's
+ * video.c puts a frame back a vsync after the next one shows): decoded into at once, its top rows -- decoded first --
+ * showed as coloured lines over the picture for a frame, most at scene changes.
+ */
+static _Atomic int plane_prev = -1;
+static uint32_t plane_prev_vsyncs;
+static uint32_t lat_copies;             /* diagnosis: pictures the plane got as their copy (pages taken back) */
 static int plane_only = 1;              /* 1: no copies into the player's pixel buffers while the plane shows the pictures (2 ms of a 4K picture's 16) */
 SYSCTL_INT(_kern, OID_AUTO, hakios_vdec_plane_only, CTLFLAG_RW | CTLFLAG_LOCKED, &plane_only, 0, "");
 static _Atomic uint64_t plane_seen;     /* mach_absolute_time of the plane's last picture from this decoder */
@@ -204,6 +214,7 @@ static uint32_t saved_iqidct_control, saved_vcop_control, saved_vld_control;
 /* Preserve probe results in the loader mailbox even if Wi-Fi drops or /dev/console is redirected. */
 extern void loader_log_line(const char *line);
 extern void hakios_wdt_init(void);
+extern void hakios_amlcpu_init(void);
 extern void hakios_wdt_stop(void);
 static void
 vdec_log(const char *format, ...)
@@ -904,6 +915,15 @@ hakios_vdec_plane_picture(uint32_t slot, uint32_t generation, struct hakios_vdec
 		out->coded_width = out->width;
 		out->coded_height = out->rows;
 	}
+	if (!error && slot < 32) {
+		/*
+		 * On the plane from here on: it marks the slot pending only after this returns, outside this lock, and a decode
+		 * in between that ran short of pages took this picture's (not yet "showing") and decoded into them while the VPU
+		 * read them -- colourful lines over Kodi's picture for a frame. hakios_vdec_plane_showing() lets the claim go.
+		 */
+		os_atomic_or(&plane_claimed, 1u << slot, release);
+		if (!out->compressed && (core_codec == CODEC_HEVC || core_codec == CODEC_VP9)) lat_copies++;
+	}
 	lck_mtx_unlock(&vdec_probe_lock);
 	return error;
 }
@@ -958,8 +978,9 @@ note_out(unsigned slot)
 		printf("vdec: to the plane: of %u pictures handed out %u taken (after <20 %u, <40 %u, <60 %u, <100 %u, <200 %u, "
 		    "more %u ms; the longest %llu), %u handed out again before\n", lat_out, lat_shown, lat_b[0], lat_b[1], lat_b[2],
 		    lat_b[3], lat_b[4], lat_b[5], lat_max, lat_never);
-		printf("vdec: to the plane, in order: %u the next picture, %u one skipped, %u more skipped, %u the same or back\n",
-		    lat_steps[1], lat_steps[2], lat_steps[3], lat_steps[0]);
+		printf("vdec: to the plane, in order: %u the next picture, %u one skipped, %u more skipped, %u the same or back; "
+		    "%u as their copy\n", lat_steps[1], lat_steps[2], lat_steps[3], lat_steps[0], lat_copies);
+		lat_copies = 0;
 		memset(lat_steps, 0, sizeof(lat_steps));
 		lat_out = lat_shown = lat_never = 0;
 		lat_max = 0;
@@ -974,8 +995,13 @@ hakios_vdec_plane_showing(int slot, int pending)
 	uint64_t now = mach_absolute_time();
 	lat_take(pending, now);
 	lat_take(slot, now);
+	if (slot != plane_slot) {
+		plane_prev = plane_slot;
+		plane_prev_vsyncs = 0;
+	}
 	plane_slot = slot;
 	plane_pending = pending;
+	os_atomic_store(&plane_claimed, 0, release);
 	if (slot >= 0 || pending >= 0) {
 		plane_seen = mach_absolute_time();
 	}
@@ -1006,12 +1032,47 @@ vdec_probe_close(__unused dev_t dev, __unused int flags, __unused int type, __un
 uint32_t
 hakios_vdec_showing(unsigned slots)
 {
-	int shown = plane_slot, pending = plane_pending;
-	uint32_t showing = 0;
+	int shown = plane_slot, pending = plane_pending, prev = plane_prev;
+	uint32_t showing = os_atomic_load(&plane_claimed, acquire);
+
+	if (prev >= 0 && (unsigned)prev < slots && prev < 32) showing |= 1u << prev;
 
 	if (shown >= 0 && (unsigned)shown < slots && shown < 32) showing |= 1u << shown;
 	if (pending >= 0 && (unsigned)pending < slots && pending < 32) showing |= 1u << pending;
-	return showing;
+	return showing & (slots >= 32 ? ~0u : (1u << slots) - 1);
+}
+
+/*
+ * Before a new picture is decoded into SLOT: while the plane shows it (or is about to, or let it go less than a frame
+ * ago), wait. User space chose the slot from what the plane showed when it last asked, and the plane may have taken it
+ * since; the decode first gives the slot's pages back and takes them again, its first page (the old picture's top rows)
+ * first, so the picture on the screen got the new one's top rows: a line of coloured dots near the top for a frame.
+ */
+void
+hakios_vdec_slot_wait(unsigned slot, unsigned slots)
+{
+	static uint32_t waits, waited_ms;
+	unsigned ms = 0;
+
+	while (ms < 120 && (hakios_vdec_showing(slots) & (1u << slot))) {
+		IOSleep(2);
+		ms += 2;
+	}
+	if (ms) {
+		waits++;
+		waited_ms += ms;
+		if (waits <= 5 || waits % 100 == 0) {
+			printf("vdec: a picture to be decoded into slot %u the plane still showed: waited %u ms (%u times, %u ms in all)\n",
+			    slot, ms, waits, waited_ms);
+		}
+	}
+}
+
+/* each vsync of the plane (its worker): the picture before is let go two vsyncs after it was replaced */
+void
+hakios_vdec_plane_vsync(void)
+{
+	if (plane_prev >= 0 && ++plane_prev_vsyncs >= 2) plane_prev = -1;
 }
 
 /* the slots a player may still ask for or the plane shows (decoded into last; their pictures kept) */
@@ -1039,6 +1100,8 @@ hakios_vdec_held(unsigned slots)
  * busy for the ~10 ms of every picture.
  */
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
 extern wait_result_t assert_wait_deadline(event_t event, wait_interrupt_t interruptible, uint64_t deadline);
 extern wait_result_t thread_block(thread_continue_t continuation);
 extern kern_return_t thread_wakeup_prim(event_t event, boolean_t one_thread, wait_result_t result);
@@ -1049,10 +1112,18 @@ static int vdec_irq_state;              /* 0 not tried, 1 attached, -1 none */
 static volatile uint32_t vdec_irq_seq;
 static uint32_t nap_woken, nap_timed, nap_quick;
 
+/*
+ * In interrupt context nothing of the decoder is touched (it may be between a stop and a reset, its registers then
+ * hang the bus; the box froze twice with the handler acknowledging the mailbox itself): the line is masked and the
+ * waiting thread woken; the thread, in a decode, acknowledges the mailbox and unmasks the line before it sleeps again.
+ */
+static volatile bool vdec_irq_masked;
+
 static void
-vdec_irq_handler(__unused void *context, __unused uint32_t intid)
+vdec_irq_handler(__unused void *context, uint32_t intid)
 {
-	hakios_dos_wr(HEVC_MBOX0_CLR, 1);
+	gic_v3_spi_mask(intid);
+	vdec_irq_masked = true;
 	os_atomic_inc(&vdec_irq_seq, relaxed);
 	thread_wakeup_prim((event_t)&vdec_irq_seq, FALSE, THREAD_AWAKENED);
 }
@@ -1077,6 +1148,12 @@ hakios_vdec_irq_nap(uint32_t seq, unsigned us)
 		}
 	}
 	if (os_atomic_load(&vdec_irq_state, acquire) != 1) return false;
+	if (vdec_irq_masked) {
+		/* (from a decode: the core runs) the mailbox acknowledged, then the line open again */
+		hakios_dos_wr(HEVC_MBOX0_CLR, 1);
+		vdec_irq_masked = false;
+		gic_v3_spi_unmask(vdec_irq);
+	}
 	uint64_t deadline;
 	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
 	assert_wait_deadline((event_t)&vdec_irq_seq, THREAD_UNINT, deadline);
@@ -1325,9 +1402,9 @@ vdec_probe_ioctl_locked(u_long command, caddr_t data)
 		 * player's controls), and a pixel buffer left empty was a black frame there */
 		stream.plane = plane_only && plane_seen && now - plane_seen < second;
 		stream.held = hakios_vdec_held(slots);
-		int shown = plane_slot, pending = plane_pending;
-		if (shown >= 0 && (unsigned)shown < slots) stream.showing |= 1u << shown;
-		if (pending >= 0 && (unsigned)pending < slots) stream.showing |= 1u << pending;
+		/* everything the plane may read: the picture on it, the one waiting, those handed to it and the one before (still
+		 * scanned for a frame); without that last one the next picture went into it nearly every time */
+		stream.showing = hakios_vdec_showing(slots);
 		memcpy(data, &stream, sizeof(stream));
 		return 0;
 	}
@@ -1551,6 +1628,7 @@ hakios_vdec_init(void)
 	thread_t thread;
 
 	hakios_wdt_init();      /* not the decoder's, but this is the box's late init and its way back (quiesce) */
+	hakios_amlcpu_init();
 
 	if (!PE_parse_boot_argn("vdec", &on, sizeof(on)) || on == 0) {
 		return;

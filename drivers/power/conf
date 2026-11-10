@@ -28,3 +28,5 @@ driver BATTGUARD
 standard bsd/dev/hakios.wdt.c
 	help    the Amlogic box's watchdog: armed at boot (wdt=<seconds>, default 20, 0: off) and fed by a kernel thread, so a
 	help    hung box resets itself; 65 s on the way back to the loader (fastboot does not feed it)
+standard bsd/dev/hakios.amlcpu.c
+	help    the Amlogic box's processor clock and core voltage, moved with the load (amlcpu=1; 2: by hand only)

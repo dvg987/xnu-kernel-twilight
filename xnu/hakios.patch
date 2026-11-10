@@ -119,16 +119,17 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..067e0e0968f1 100644
+index 44274016a4cf..09e2261c8751 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,67 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,69 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
 +# HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
 +bsd/dev/hakios.audio.c                   standard
 +bsd/dev/hakios.hdmiaudio.c               standard
++bsd/dev/hakios.gamepad.c                 standard
 +bsd/dev/hakios.version.c                 standard
 +bsd/dev/hakios.platform.c                standard
 +bsd/dev/hakios.stubs.c                   standard
@@ -144,6 +145,7 @@ index 44274016a4cf..067e0e0968f1 100644
 +bsd/dev/hakios.cec.c                     standard
 +bsd/dev/hakios.net.c                     standard
 +bsd/dev/hakios.wdt.c                     standard
++bsd/dev/hakios.amlcpu.c                  standard
 +bsd/dev/hakios.image.c                   standard
 +bsd/dev/hakios.sparse.c                  standard
 +bsd/dev/hakios.apfs_check.c              optional apfs
@@ -190,7 +192,7 @@ index 44274016a4cf..067e0e0968f1 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +216,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +218,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -243,7 +245,7 @@ index 44274016a4cf..067e0e0968f1 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +468,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +470,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -251,7 +253,7 @@ index 44274016a4cf..067e0e0968f1 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +491,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +493,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -2394,6 +2396,127 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d89b0f19cff7..c9c09952e279 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -340,6 +340,108 @@ SECURITY_READ_ONLY_LATE(vm_offset_t)     static_memory_end;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)    avail_start;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)    avail_end;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)    real_avail_end;
++
++/*
++ * hakios: holes in the kernel's memory window. A boot loader that has things of its own in the middle
++ * of RAM (twilight's twloader: the boot framebuffer, its mailbox and the screenshots the rescue Linux
++ * reads back after a run) still hands the kernel one window over all of it, so that the window is the
++ * RAM around them too, and names those ranges in the boot-arg twl_holes=BASE+SIZE[,BASE+SIZE...] (hex).
++ * Their pages keep their place in vm_pages (arm64 finds a page's number from it), but pmap_startup()
++ * marks them like retired pages and never frees them; max_mem and sane_size leave them out.
++ */
++#define HAKIOS_PHYS_HOLES_MAX 8
++static struct { pmap_paddr_t start, end; } hakios_phys_holes[HAKIOS_PHYS_HOLES_MAX];
++static unsigned int hakios_phys_hole_count;
++SECURITY_READ_ONLY_LATE(uint64_t) hakios_phys_hole_bytes;
++
++static uint64_t
++hakios_hex(const char **pp)
++{
++	const char *p = *pp;
++	uint64_t v = 0;
++
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		p += 2;
++	}
++	for (;; p++) {
++		unsigned int d;
++		if (*p >= '0' && *p <= '9') {
++			d = (unsigned int)(*p - '0');
++		} else if (*p >= 'a' && *p <= 'f') {
++			d = (unsigned int)(*p - 'a' + 10);
++		} else if (*p >= 'A' && *p <= 'F') {
++			d = (unsigned int)(*p - 'A' + 10);
++		} else {
++			break;
++		}
++		v = (v << 4) | d;
++	}
++	*pp = p;
++	return v;
++}
++
++static void
++hakios_phys_holes_init(void)
++{
++	char arg[160];
++	const char *p = arg;
++
++	if (!PE_parse_boot_arg_str("twl_holes", arg, sizeof(arg))) {
++		return;
++	}
++	while (*p != '\0' && hakios_phys_hole_count < HAKIOS_PHYS_HOLES_MAX) {
++		pmap_paddr_t start = hakios_hex(&p), end;
++		if (*p++ != '+') {
++			break;
++		}
++		end = start + hakios_hex(&p);
++		start = trunc_page(start);
++		end = round_page(end);
++		/* only what lies among the pages the VM is given; the kernel's own image and data below are never a hole */
++		if (start < avail_start) {
++			start = avail_start;
++		}
++		if (end > avail_end) {
++			end = avail_end;
++		}
++		if (end > start) {
++			hakios_phys_holes[hakios_phys_hole_count].start = start;
++			hakios_phys_holes[hakios_phys_hole_count].end = end;
++			hakios_phys_hole_count++;
++			hakios_phys_hole_bytes += end - start;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	if (hakios_phys_hole_bytes < sane_size) {
++		sane_size -= hakios_phys_hole_bytes;
++		max_mem -= hakios_phys_hole_bytes;
++	}
++}
++
++bool
++hakios_phys_hole(ppnum_t pn)
++{
++	pmap_paddr_t pa = ptoa(pn);
++
++	for (unsigned int i = 0; i < hakios_phys_hole_count; i++) {
++		if (pa >= hakios_phys_holes[i].start && pa < hakios_phys_holes[i].end) {
++			return true;
++		}
++	}
++	return false;
++}
++
++void
++hakios_phys_holes_report(void)
++{
++	for (unsigned int i = 0; i < hakios_phys_hole_count; i++) {
++		printf("hakios: memory window hole %#llx..%#llx (%llu MB): the boot loader's, never given out\n",
++		    (unsigned long long)hakios_phys_holes[i].start, (unsigned long long)hakios_phys_holes[i].end,
++		    (unsigned long long)((hakios_phys_holes[i].end - hakios_phys_holes[i].start) >> 20));
++	}
++}
+ SECURITY_READ_ONLY_LATE(unsigned long)   real_phys_size;
+ SECURITY_READ_ONLY_LATE(vm_map_address_t) physmap_base = (vm_map_address_t)0;
+ SECURITY_READ_ONLY_LATE(vm_map_address_t) physmap_end = (vm_map_address_t)0;
+@@ -2202,6 +2304,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	sane_size = mem_size - (avail_start - gPhysBase);
+ 	max_mem = mem_size;
++	hakios_phys_holes_init();
+ 	vm_kernel_slid_base = segLOWESTTEXT;
+ 	// vm_kernel_slide is set by arm_init()->arm_slide_rebase_and_sign_image()
+ 	vm_kernel_stext = segTEXTB;
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -3371,6 +3494,66 @@ index 8b46efb05c86..e161ca426b1a 100644
  extern kern_return_t
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 0aab8cc3cfdc..8bfa4a226466 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -641,6 +641,10 @@ static boolean_t fill = FALSE;
+ static unsigned int fillval;
+ uint_t vm_delayed_count = 0;    /* when non-zero, indicates we may have more pages to init */
+ ppnum_t delay_above_pnum = PPNUM_MAX;
++#if defined(__arm64__)
++extern bool hakios_phys_hole(ppnum_t pn);        /* arm_vm_init.c: twl_holes */
++extern void hakios_phys_holes_report(void);
++#endif
+ 
+ /*
+  * For x86 first 8 Gig initializes quickly and gives us lots of lowmem + mem above to start off with.
+@@ -1321,6 +1325,11 @@ pmap_steal_memory_internal(
+ 		if (!pmap_next_page_hi(&phys_page, might_free)) {
+ 			panic("pmap_steal_memory() size: 0x%llx", (uint64_t)size);
+ 		}
++#if defined(__arm64__)
++		if (hakios_phys_hole(phys_page)) {
++			panic("pmap_steal_memory(): page %#x is in a hole of the boot loader's (twl_holes)", phys_page);
++		}
++#endif
+ 
+ #if defined(__x86_64__)
+ 		pmap_pre_expand(kernel_pmap, map_addr);
+@@ -1532,6 +1541,7 @@ pmap_startup(
+ #endif
+ 
+ 	vm_delayed_count = 0;
++	unsigned int hole_pages = 0;
+ 
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &start_ns);
+ 	vm_pages_count = 0;
+@@ -1567,6 +1577,13 @@ pmap_startup(
+ #endif
+ 		++vm_pages_count;
+ 		vm_page_init(&vm_pages[i], phys_page, FALSE);
++#if defined(__arm64__)
++		if (hakios_phys_hole(phys_page)) {
++			vm_pages[i].vmp_error = TRUE;   /* hakios: the boot loader's, inside the window: kept like a retired page */
++			hole_pages++;
++			continue;
++		}
++#endif
+ 		if (fill) {
+ 			fillPage(phys_page, fillval);
+ 		}
+@@ -1587,6 +1604,10 @@ pmap_startup(
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 	printf("pmap_startup() init/release time: %lld microsec\n", (now_ns - start_ns) / NSEC_PER_USEC);
+ 	printf("pmap_startup() delayed init/release of %d pages\n", vm_delayed_count);
++#if defined(__arm64__)
++	hakios_phys_holes_report();
++	printf("pmap_startup() kept %u pages in the boot loader's holes\n", hole_pages);
++#endif
+ 
+ #if defined(__LP64__)
+ 	if ((vm_page_t)(VM_PAGE_UNPACK_PTR(VM_PAGE_PACK_PTR(&vm_pages[0]))) != &vm_pages[0]) {
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743fc3efb..ce036c5a2c26 100644
 --- a/pexpert/arm/pe_fiq.c

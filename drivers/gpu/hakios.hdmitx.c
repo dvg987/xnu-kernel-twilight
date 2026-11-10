@@ -2614,7 +2614,11 @@ static struct {
 	unsigned high_polls;
 	unsigned plugs;
 	volatile int cmd;                       /* from sysctl, for the thread */
+	bool sleeping;                          /* tvOS asleep (kern.hakios_hdmitx_sleep): no output, none set up again */
+	struct txmode sleep_mode;               /* the mode it had, set again on waking */
 } hp;
+extern void hakios_amlcpu_sleep(bool asleep);
+static volatile int wake_request;               /* the TV asked for this box while asleep (hakios_hdmitx_request_wake) */
 
 /* a command for the hot-plug thread (1-9, as kern.hakios_hdmitx_cmd) */
 static void
@@ -2642,7 +2646,7 @@ scdc_status(void)
 
 /* A TV is on the line: its EDID, its physical address to CEC, the mode. With the lock held. */
 static void
-plugged(void)
+plugged(bool hotplug __unused)
 {
 	bool edid = false;
 
@@ -2651,8 +2655,8 @@ plugged(void)
 	}
 	if (edid) {
 		make_timings();
-		hakios_cec_hotplug(h.physical_address);
 	}
+	hakios_cec_hotplug(h.physical_address);         /* (each time: CEC may have missed the first, at boot) */
 	if (h.mode.vic == 0 || (edid && !mode_ok(&h.mode))) {
 		struct txmode was = h.mode;
 		bool from_edid = select_mode(&h.mode);
@@ -2684,13 +2688,41 @@ run_cmd(int cmd)
 		}
 		break;
 	case 3:
-		plugged();
+		plugged(false);             /* (a mode asked for: set, whatever the TV) */
 		break;
 	case 4:
 		output_off();
 		break;
 	case 7:
 		scdc_status();
+		break;
+	case 10:
+		/* tvOS goes to sleep: the TV told to stand by (below), the output off and left so */
+		hp.sleeping = true;
+		wake_request = 0;
+		hp.sleep_mode = h.mode;
+		output_off();
+		printf("hdmitx: asleep: output off\n");
+		hakios_amlcpu_sleep(true);
+		break;
+	case 11:
+		/* and wakes: the output again (now, if the TV's line is up; else once it comes up), the TV woken (below) */
+		hp.sleeping = false;
+		hakios_amlcpu_sleep(false);
+		/* the mode it had (a TV just woken may not answer for its EDID yet: without one it was 1080p, then tvOS's) */
+		if (hp.sleep_mode.vic != 0) {
+			h.mode = hp.sleep_mode;
+		}
+		if (hpd_high()) {
+			/* the mode set again as it was: no EDID read, no modes told to tvOS again (a TV still waking gave a short
+			 * EDID, tvOS took 1080p from it and then 4K again: five mode sets, the screen blank between) */
+			(void)modeset(&h.mode);
+			IOSleep(200);
+			scdc_status();
+		} else {
+			hp.need_set = true;
+		}
+		printf("hdmitx: awake: output %s\n", hpd_high() ? "set up" : "set up once the TV is there");
 		break;
 	case 8:
 	case 9:
@@ -2703,8 +2735,8 @@ run_cmd(int cmd)
 		break;
 	}
 	lck_mtx_unlock(&hdmitx_lock);
-	if (cmd == 5 || cmd == 6) {
-		hakios_cec_request(cmd == 5 ? HAKIOS_CEC_STANDBY : HAKIOS_CEC_ONE_TOUCH_PLAY);
+	if (cmd == 5 || cmd == 6 || cmd == 10 || cmd == 11) {
+		hakios_cec_request(cmd == 5 || cmd == 10 ? HAKIOS_CEC_STANDBY : HAKIOS_CEC_ONE_TOUCH_PLAY);
 	}
 }
 
@@ -2725,6 +2757,57 @@ cmd_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int a
 	hp.cmd = v;                                             /* the hot-plug thread runs it */
 	return 0;
 }
+
+/* asleep (for hakios.cec.c: the TV's remote wakes tvOS then) */
+bool
+hakios_hdmitx_asleep(void)
+{
+	return hp.sleeping;
+}
+
+/*
+ * The TV asked for this box while tvOS sleeps (hakios.cec.c): tvOS's PineBoard, which looks while asleep
+ * (tvos/src/twlpb.c), wakes the system as the remote's button would -- a key from here does not wake it.
+ */
+void
+hakios_hdmitx_request_wake(void)
+{
+	hakios_amlcpu_sleep(false);
+	wake_request = 1;
+}
+
+static int
+wake_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = wake_request, error = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (!error && req->newptr != USER_ADDR_NULL) {
+		wake_request = v;
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, hakios_hdmitx_wake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, wake_sysctl, "I", "1: the TV asked for this box while asleep (CEC); 0 once taken");
+
+/* tvOS's display state (tvos/src/twlpb.c, -[SSDisplay setState:]): 1 asleep (the TV to standby, the output off), 0 awake */
+static int
+sleep_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = hp.sleeping, error = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (error || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (h.ana == 0) {
+		return ENODEV;
+	}
+	hp.cmd = v ? 10 : 11;                                   /* the hot-plug thread runs it */
+	return 0;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, hakios_hdmitx_sleep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, sleep_sysctl, "I", "tvOS asleep: 1 (CEC standby, HDMI output off), 0 (output on, CEC one touch play)");
 
 SYSCTL_PROC(_kern, OID_AUTO, hakios_hdmitx_cmd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     NULL, 0, cmd_sysctl, "I", "HDMI: 1 state, 2 EDID, 3 set the mode, 4 output off, 5 CEC standby, 6 CEC one touch play, 7 SCDC, 8/9 OSD blend YCbCr/RGB");
@@ -2999,11 +3082,11 @@ hotplug_thread(void *arg __unused, wait_result_t wr_ __unused)
 				hp.need_set = true;
 			}
 		}
-		if (hpd && hp.need_set && hp.enabled && ++hp.high_polls >= 5) {
+		if (hpd && hp.need_set && hp.enabled && !hp.sleeping && ++hp.high_polls >= 5) {
 			hp.need_set = false;
 			printf("hdmitx: plug %u: setting the output up\n", ++hp.plugs);
 			lck_mtx_lock(&hdmitx_lock);
-			plugged();
+			plugged(true);
 			lck_mtx_unlock(&hdmitx_lock);
 		}
 		if (hpd && !hp.need_set && tick % 10 == 0 && output_alive()) {

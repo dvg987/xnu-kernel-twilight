@@ -1883,6 +1883,15 @@ IOMobileFramebuffer::scanPanel(void)
  * A swap's video layer to the video plane, in the frame's own pixels (the swap places both on the display); a few swaps
  * in a row without one and the plane is let go (the window server leaves it out of a swap now and then).
  */
+/* a decoder's picture, which the video plane shows by its token (TWL_VPLANE_TOKEN_KEY) */
+static bool
+hasPlaneToken(MiniIOSurface * v)
+{
+	OSData * token = v != NULL && v->values != NULL ? OSDynamicCast(OSData, v->values->getObject(TWL_VPLANE_TOKEN_KEY)) : NULL;
+
+	return token != NULL && token->getLength() == TWL_VPLANE_TOKEN_SIZE;
+}
+
 void
 IOMobileFramebuffer::showVideo(const uint8_t * swap, MiniIOSurface * v, const int32_t src[4], const int32_t dst[4],
     const int32_t mainDst[4], uint32_t mainW, uint32_t mainH)
@@ -1982,8 +1991,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (t->info.bytesPerElement == 4 && t->info.planeCount == 0) {
 			mainLayer = mainLayer < 0 ? (int) layer : mainLayer;
-		} else if (videoLayer < 0 && t->info.planeCount == 2 && t->planes[0].bytesPerElement == 1 &&
-		    t->planes[1].bytesPerElement == 2) {
+		} else if (videoLayer < 0 && t->info.planeCount == 2 && ((t->planes[0].bytesPerElement == 1 &&
+		    t->planes[1].bytesPerElement == 2) || hasPlaneToken(t))) {
+			/* (8-bit 4:2:0, or any picture of the decoder's: the plane shows that by its token, whatever the copy's
+			 * format -- the screensaver's packed 10-bit 'p420' was "not one shown", and its screen black) */
 			videoLayer = (int) layer;
 		} else {
 			static uint32_t odd;
