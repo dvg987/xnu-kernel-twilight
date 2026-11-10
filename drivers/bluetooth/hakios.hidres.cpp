@@ -66,13 +66,17 @@ hid_key(uint32_t usage)
 		switch (u) {
 		case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: /* select, up, down, left, right */
 		case 0xcd: case 0xe9: case 0xea: case 0xe2:             /* play/pause, volume, mute */
+		case 0x188:                                             /* the Mi remote's YouTube button (libtwlhook opens the app) */
 			return usage;
 		case 0x224:
-			return 0x070029;                /* AC Back: a keyboard's Escape is tvOS's back */
+			return 0x0c0046;                /* AC Back: the consumer Menu Escape is tvOS's back */
 		case 0x223: case 0x40:
 			return 0x0c0040;                /* AC Home, Menu: the consumer Menu is tvOS's home */
 		}
 		return 0;
+	}
+	if (page == 0x07 && u == 0x29) {
+		return 0x0c0046;                        /* a keyboard's Escape: back, as above */
 	}
 	if (page == 0x07 && u >= 0x04 && u <= 0x65) {
 		return usage;                           /* a keyboard's key (arrows, return, escape: the remote's own) */
@@ -386,7 +390,7 @@ pad_keys(const struct pad_state * st, bool claimed, uint32_t * held)
 	if (b & PAD_LEFT) { held[count++] = 0x0c0044; }
 	if (b & PAD_RIGHT) { held[count++] = 0x0c0045; }
 	if (b & PAD_A) { held[count++] = 0x0c0041; }
-	if (b & PAD_B) { held[count++] = 0x070029; }      /* Escape: tvOS's back */
+	if (b & PAD_B) { held[count++] = 0x0c0046; }      /* Menu Escape: tvOS's back */
 	if (b & PAD_MENU) { held[count++] = 0x0c00cd; }
 	return count;
 }
