@@ -82,6 +82,7 @@ power   bsd/dev/hakios.pmic.c
 power   bsd/dev/hakios.battguard.c
 bluetooth bsd/dev/hakios.bt.c
 storage  bsd/dev/hakios.emmc.c
+storage  bsd/dev/hakios.usbdisk.c
 input    bsd/dev/hakios.crgudc.c
 input    bsd/dev/hakios.cec.c
 wifi     bsd/dev/hakios.xhci.c

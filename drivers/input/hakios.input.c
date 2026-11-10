@@ -10,6 +10,7 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
@@ -106,6 +107,10 @@ count_fingers(uint32_t type, uint32_t finger)
 	}
 }
 
+/* how many buttons have gone down since the start, whatever they came from: has the user got a remote that works? */
+static uint32_t buttons_pressed;
+SYSCTL_UINT(_kern, OID_AUTO, hakios_buttons, CTLFLAG_RD | CTLFLAG_LOCKED, &buttons_pressed, 0, "");
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
@@ -124,6 +129,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 		hakios_tl("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
 	}
 	t->type = type;
+	if (type == HAKIOS_BUTTON_DOWN) {
+		buttons_pressed++;
+	}
 	t->finger = finger;
 	t->x = x > 65535 ? 65535 : x;
 	t->y = y > 65535 ? 65535 : y;

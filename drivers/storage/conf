@@ -24,3 +24,6 @@ driver VIRTIO_BLK
 
 standard bsd/dev/hakios.emmc.c
 	help    the Amlogic box's eMMC as /dev/emmc_darwin (emmc=1 read only, emmc=2 writable): the SD_EMMC controller as U-Boot left it
+
+standard bsd/dev/hakios.usbdisk.c
+	help    a USB disk on the Amlogic box's outside port as /dev/usb_darwin and /dev/usb_darwin_data (usbdisk=1): the disk the box boots from

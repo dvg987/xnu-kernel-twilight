@@ -119,10 +119,10 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..09e2261c8751 100644
+index 44274016a4cf..ede1edfef148 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,69 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,70 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -150,6 +150,7 @@ index 44274016a4cf..09e2261c8751 100644
 +bsd/dev/hakios.sparse.c                  standard
 +bsd/dev/hakios.apfs_check.c              optional apfs
 +bsd/dev/hakios.emmc.c                    standard
++bsd/dev/hakios.usbdisk.c                 standard
 +bsd/dev/hakios.xhci.c                    standard
 +bsd/dev/hakios.w2.c                      standard
 +bsd/dev/hakios.w2wpa.c                   standard
@@ -192,7 +193,7 @@ index 44274016a4cf..09e2261c8751 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +218,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +219,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -245,7 +246,7 @@ index 44274016a4cf..09e2261c8751 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +470,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +471,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -253,7 +254,7 @@ index 44274016a4cf..09e2261c8751 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +493,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +494,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -480,10 +481,10 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..b44d7994e0b4 100644
+index 4df41ba1f61b..b4123546b6f7 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,21 @@
+@@ -147,6 +147,22 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
@@ -491,6 +492,7 @@ index 4df41ba1f61b..b44d7994e0b4 100644
 +#include <sys/hakios.audio.h>
 +#include <sys/hakios.virtio_blk.h>
 +#include <sys/hakios.emmc.h>
++#include <sys/hakios.usbdisk.h>
 +#include <sys/hakios.crgudc.h>
 +#include <sys/hakios.cec.h>
 +#include <sys/hakios.hdmitx.h>
@@ -505,7 +507,7 @@ index 4df41ba1f61b..b44d7994e0b4 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +505,7 @@ bsd_init(void)
+@@ -490,7 +506,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -514,7 +516,7 @@ index 4df41ba1f61b..b44d7994e0b4 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +991,23 @@ bsd_init(void)
+@@ -976,6 +992,24 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -523,6 +525,7 @@ index 4df41ba1f61b..b44d7994e0b4 100644
 +		hakios_audio_init();           /* /dev/hakios-audio */
 +		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 +		hakios_emmc_init();            /* /dev/emmc_darwin, the Amlogic box's eMMC */
++		hakios_usbdisk_init();         /* /dev/usb_darwin, a disk on the box's USB port */
 +		hakios_crgudc_init();          /* keys from the host over the box's USB port */
 +		hakios_hdmitx_init();          /* the HDMI transmitter: its mode and the TV's EDID (before CEC: the physical address) */
 +		hakios_cec_init();             /* the TV's remote over HDMI-CEC */
@@ -552,7 +555,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..a22095ccf5f0 100644
+index 1d71c66629fb..162cc1fe6fd5 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -745,7 +748,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	ret = persona_proc_adopt(p, persona, cred);
  
  	kauth_cred_unref(&cred);
-@@ -5586,10 +5685,75 @@ bad:
+@@ -5586,10 +5685,91 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -755,26 +758,39 @@ index 1d71c66629fb..a22095ccf5f0 100644
 + * environment, so that dyld loads our library into it. Several such groups may follow each
 + * other, separated by ";". A program named in more than one group gets every one of those
 + * libraries, joined with ":" in the one DYLD_INSERT_LIBRARIES, so SpringBoard can carry both
-+ * our window-server library and the tweak loader. launchd refuses to pass DYLD_ variables
-+ * from a job description, which is why the kernel adds this one. Set once by our init (from
-+ * etc/inject.conf) before it hands over to launchd.
++ * our window-server library and the tweak loader. The NAME "@apps" stands for every program
++ * of an application the user installed: one inside a ".app" directory under /var. launchd
++ * refuses to pass DYLD_ variables from a job description, which is why the kernel adds this
++ * one. Set once by our init (from etc/inject.conf) before it hands over to launchd.
 + */
 +static char exec_inject_conf[512];
 +SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
 +    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
 +
 +static bool
++exec_inject_user_app(struct image_params *imgp)
++{
++	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++
++	if (strncmp(path, "/private", 8) == 0) {
++		path += 8;
++	}
++	return strncmp(path, "/var/", 5) == 0 && strnstr(path, ".app/", MAXPATHLEN) != NULL;
++}
++
++static bool
 +exec_inject_env(struct image_params *imgp, char *env, size_t size)
 +{
 +	const char *name, *p = exec_inject_conf;
 +	size_t namelen, used;
-+	bool any = false;
++	bool any = false, user_app;
 +
 +	if (*p == 0 || imgp->ip_ndp == NULL) {
 +		return false;
 +	}
 +	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
 +	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	user_app = exec_inject_user_app(imgp);
 +	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
 +	while (*p != 0) {
 +		const char *library;
@@ -799,6 +815,9 @@ index 1d71c66629fb..a22095ccf5f0 100644
 +			    strncmp(word, name, namelen) == 0) {
 +				matched = true;         /* this group names this program; its library is added once */
 +			}
++			if (user_app && liblen != 0 && (size_t)(p - word) == 5 && strncmp(word, "@apps", 5) == 0) {
++				matched = true;
++			}
 +		}
 +		if (matched && liblen != 0 && used + 1 + liblen < size) {
 +			if (any) {
@@ -821,7 +840,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5923,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5759,6 +5939,33 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -855,7 +874,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -6636,7 +6827,23 @@ handle_mac_transition:
+@@ -6636,7 +6843,23 @@ handle_mac_transition:
  	}
  
  	/* Update the process' identity version and set the security token */
@@ -880,7 +899,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7538,6 +7761,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:
